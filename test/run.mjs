@@ -515,6 +515,16 @@ group("Pin dialog order + pin_file path normalization");
     const bare = await tool.pin_file.handler({ path: "@" }, inv);
     check("pin_file rejects a bare @", /no file path/i.test(bare) && readPins().length === 0);
 
+    // A missing session-rooted file must report only an fs error code and the
+    // relative display path — never the absolute session/home path (which fs
+    // error messages embed) and never the raw error message.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    const missOut = await tool.pin_file.handler({ path: "missing.md" }, inv);
+    check("pin_file (missing file) reports an error code, not a message", /error code \w+/.test(missOut));
+    check("pin_file (missing file) does not leak the absolute path", !missOut.includes(state.sessionRoot));
+    check("pin_file (missing file) uses the relative display path", missOut.includes("missing.md") && readPins().length === 0);
+
     // /pin remove <n> reports the pin number in the deletion message.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;

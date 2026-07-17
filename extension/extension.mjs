@@ -299,7 +299,7 @@ function pinLabel(pin, index, sessionId) {
     // Show the path as stored: relative to the session files folder for files that
     // live there, absolute for files anywhere else. Normalized via the resolved
     // absolute path so even legacy/absolute-stored session files display relative.
-    const display = toStoredPath(resolveFilePin(pin, sessionId), sessionId);
+    const display = pinPathDisplay(pin, sessionId);
     return `${mark} ${number} @${display}`;
 }
 
@@ -351,10 +351,16 @@ async function buildPin(raw, sessionId) {
         try {
             info = await stat(absolutePath);
         } catch (error) {
-            return { ok: false, error: `Cannot pin ${fmtPath(absolutePath)}: ${error.message}` };
+            return {
+                ok: false,
+                error: `Cannot pin ${fmtDisplayPath(absolutePath, sessionId)}: ${fsErrorReason(error)}.`,
+            };
         }
         if (!info.isFile()) {
-            return { ok: false, error: `Cannot pin ${fmtPath(absolutePath)}: it is not a file.` };
+            return {
+                ok: false,
+                error: `Cannot pin ${fmtDisplayPath(absolutePath, sessionId)}: it is not a file.`,
+            };
         }
 
         return {
@@ -422,7 +428,30 @@ function fmtPath(p) {
 // session), matching the pinboard and avoiding leaking the home dir/username into
 // model-visible output for session-rooted pins.
 function fileLabel(pin, sessionId) {
-    return fmtPath(toStoredPath(resolveFilePin(pin, sessionId), sessionId));
+    return fmtDisplayPath(resolveFilePin(pin, sessionId), sessionId);
+}
+
+// The single place that turns a resolved *absolute* path into safe, display-ready
+// text: apply the session-rooted display transform (relative inside the session,
+// absolute outside), then backtick-wrap. Every user- and model-facing path string
+// must go through this (or fileLabel / pinPathDisplay) so no call site can
+// accidentally leak the session/home absolute path for a session-rooted file.
+function fmtDisplayPath(absolutePath, sessionId) {
+    return fmtPath(toStoredPath(absolutePath, sessionId));
+}
+
+// The display path of a file pin, without formatting (for the pinboard and picker
+// labels that add their own `@` prefix).
+function pinPathDisplay(pin, sessionId) {
+    return toStoredPath(resolveFilePin(pin, sessionId), sessionId);
+}
+
+// A safe reason string for a filesystem error. Node's fs error messages embed the
+// absolute path (e.g. "ENOENT: no such file or directory, stat '<abs>'"), which
+// would leak the session/home path into model-visible output, so report only the
+// error code.
+function fsErrorReason(error) {
+    return error?.code ? `error code ${error.code}` : "an unknown error";
 }
 
 function elicitationEnabled() {
@@ -524,7 +553,7 @@ async function editPin(ctx, store, index) {
         (p) => p !== pin && p.type === "file" && resolveFilePin(p, ctx.sessionId) === absolutePath,
     );
     if (duplicate) {
-        await session.log(`That file is already pinned: ${fmtPath(absolutePath)}`, { level: "info" });
+        await session.log(`That file is already pinned: ${fmtDisplayPath(absolutePath, ctx.sessionId)}`, { level: "info" });
         return;
     }
 
@@ -532,17 +561,17 @@ async function editPin(ctx, store, index) {
     try {
         info = await stat(absolutePath);
     } catch (error) {
-        await session.log(`Cannot pin ${fmtPath(absolutePath)}: ${error.message}`, { level: "error" });
+        await session.log(`Cannot pin ${fmtDisplayPath(absolutePath, ctx.sessionId)}: ${fsErrorReason(error)}.`, { level: "error" });
         return;
     }
     if (!info.isFile()) {
-        await session.log(`Cannot pin ${fmtPath(absolutePath)}: it is not a file.`, { level: "error" });
+        await session.log(`Cannot pin ${fmtDisplayPath(absolutePath, ctx.sessionId)}: it is not a file.`, { level: "error" });
         return;
     }
 
     pin.path = toStoredPath(absolutePath, ctx.sessionId);
     await saveStore(ctx.sessionId, store);
-    await session.log(`Updated live file pin: ${fmtPath(absolutePath)}`, { level: "info" });
+    await session.log(`Updated live file pin: ${fmtDisplayPath(absolutePath, ctx.sessionId)}`, { level: "info" });
 }
 
 async function deletePin(ctx, store, index) {
@@ -604,7 +633,7 @@ async function openPinboard(ctx) {
             const detail =
                 selected.type === "prompt"
                     ? selected.text
-                    : `@${toStoredPath(resolveFilePin(selected, ctx.sessionId), ctx.sessionId)}`;
+                    : `@${pinPathDisplay(selected, ctx.sessionId)}`;
             const toggleLabel = isEnabled(selected) ? "Disable" : "Enable";
             const action = await choose(detail, ["Edit", toggleLabel, "Delete"]);
 
@@ -888,7 +917,7 @@ async function renderPinnedContext(sessionId) {
             // Node fs messages embed the absolute path, which would leak the home
             // dir/username into the prompt for session-rooted pins (the path
             // attribute already avoids this).
-            const reason = error?.code ? `error code ${error.code}` : "an unknown error";
+            const reason = fsErrorReason(error);
             sections.push(
                 `<live-file-pin id="${escapeXmlAttr(pin.id)}" path="${escapeXmlAttr(displayPath)}" unreadable="true">\n` +
                     `The pinned file could not be read (${escapeXml(reason)}).\n` +
@@ -1046,7 +1075,7 @@ const tools = [
                     }
                     return pin.type === "prompt"
                         ? `${head}: ${shortText(pin.text)}`
-                        : `${head}: ${fmtPath(toStoredPath(resolveFilePin(pin, invocation.sessionId), invocation.sessionId))}`;
+                        : `${head}: ${fileLabel(pin, invocation.sessionId)}`;
                 })
                 .join("\n");
         },
