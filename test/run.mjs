@@ -1,0 +1,560 @@
+// Persistent test suite for the session-pins extension.
+//
+// Runs the REAL extension.mjs (via test/sdk-loader.mjs, which mocks the Copilot
+// SDK) and drives its tools and prompt hook against throwaway temp session
+// folders. Covers the behaviours that past code review flagged:
+//   1. Consent gates on model-initiated pins
+//   2. XML escaping of injected content + attributes
+//   3. Dropping malformed pins on load (no crash)
+//   4. Durable atomic saves (valid, complete pins.json; no temp litter)
+//
+// Run:  npm test   (from the plugin folder)
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const state = {
+    sessionRoot: null,
+    elicitation: true,
+    confirmReturn: true,
+    confirmCalls: [],
+    logs: [],
+    // Queue of responders for the interactive picker (choose -> session.ui.elicitation).
+    // Each responder gets (message, options) and returns the option to pick, or null.
+    // When the queue is exhausted, the picker is cancelled (returns null).
+    elicitResponders: [],
+};
+
+globalThis.__pins = {
+    session: {
+        get workspacePath() { return state.noWorkspace ? undefined : state.sessionRoot; },
+        get capabilities() { return { ui: state.elicitation ? { elicitation: true } : {} }; },
+        ui: {
+            async confirm(message) { state.confirmCalls.push(message); return state.confirmReturn; },
+            async select() { return null; },
+            async input() { return null; },
+            async elicitation({ message, requestedSchema }) {
+                const options = (requestedSchema?.properties?.selection?.oneOf ?? []).map((o) => o.const);
+                const responder = state.elicitResponders.shift();
+                const selection = responder ? responder(message, options) : null;
+                return selection == null
+                    ? { action: "cancel" }
+                    : { action: "accept", content: { selection } };
+            },
+        },
+        async log(message) { state.logs.push(message); },
+    },
+};
+
+// Import the real extension (loader maps the SDK specifier to sdk-mock.mjs).
+await import(new URL("../extension/extension.mjs", import.meta.url));
+const { tools, hooks } = globalThis.__pins;
+const tool = Object.fromEntries(tools.map((t) => [t.name, t]));
+const inv = { sessionId: "test-session" };
+
+let passed = 0;
+let failed = 0;
+function check(name, condition) {
+    if (condition) {
+        passed++;
+        console.log("  \u2713", name);
+    } else {
+        failed++;
+        console.log("  \u2717 FAIL:", name);
+    }
+}
+function group(name) { console.log("\n" + name); }
+
+function freshSession() {
+    state.sessionRoot = mkdtempSync(join(tmpdir(), "pinsess-"));
+    mkdirSync(join(state.sessionRoot, "files"), { recursive: true });
+    state.confirmCalls.length = 0;
+    state.logs.length = 0;
+    state.elicitResponders.length = 0;
+    state.noWorkspace = false;
+    return state.sessionRoot;
+}
+function readPins() {
+    const file = join(state.sessionRoot, "pins.json");
+    return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")).pins : [];
+}
+function seedPins(pins) {
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({ version: 1, pins }));
+}
+async function render() {
+    return (await hooks.onUserPromptSubmitted({}, inv))?.additionalContext ?? "";
+}
+
+// ---------------------------------------------------------------------------
+group("Consent gates (model-initiated pins)");
+{
+    // pin_prompt: approve
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    let out = await tool.pin_prompt.handler({ text: "always run tests" }, inv);
+    check("pin_prompt asks for confirmation", state.confirmCalls.length === 1);
+    check("pin_prompt (approved) persists the pin", readPins().some((p) => p.text === "always run tests"));
+
+    // pin_prompt: decline
+    freshSession();
+    state.confirmReturn = false;
+    out = await tool.pin_prompt.handler({ text: "sneaky" }, inv);
+    check("pin_prompt (declined) does not pin", readPins().length === 0);
+    check("pin_prompt (declined) says so", /declined/i.test(out));
+
+    // pin_prompt: no elicitation UI -> refuse, never persist
+    freshSession();
+    state.elicitation = false;
+    out = await tool.pin_prompt.handler({ text: "no ui" }, inv);
+    check("pin_prompt (no UI) refuses without asking", state.confirmCalls.length === 0 && /confirmation/i.test(out));
+    check("pin_prompt (no UI) does not pin", readPins().length === 0);
+
+    // pin_file: approve (even for an in-context file under <session>/files)
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "note.md"), "hello");
+    out = await tool.pin_file.handler({ path: "note.md" }, inv);
+    check("pin_file asks for confirmation", state.confirmCalls.length === 1);
+    check("pin_file (approved) persists the pin", readPins().some((p) => p.type === "file"));
+
+    // pin_file: decline
+    freshSession();
+    state.confirmReturn = false;
+    writeFileSync(join(state.sessionRoot, "files", "note.md"), "hello");
+    out = await tool.pin_file.handler({ path: "note.md" }, inv);
+    check("pin_file (declined) does not pin", readPins().length === 0);
+
+    // pin_file: no UI -> refuse
+    freshSession();
+    state.elicitation = false;
+    writeFileSync(join(state.sessionRoot, "files", "note.md"), "hello");
+    out = await tool.pin_file.handler({ path: "note.md" }, inv);
+    check("pin_file (no UI) refuses without asking", state.confirmCalls.length === 0 && /confirmation/i.test(out));
+}
+
+// ---------------------------------------------------------------------------
+group("XML escaping + malformed-pin handling (prompt hook)");
+{
+    freshSession();
+    state.elicitation = true;
+    // '&' is legal in a Windows filename and must be escaped in the path attribute.
+    const ampName = "a & b.md";
+    writeFileSync(join(state.sessionRoot, "files", ampName), 'content with <tag> & "quote"');
+    // An unreadable pin whose stored (absolute) path has " < > ' & exercises the
+    // catch branch + attribute escaping without needing such a file to exist.
+    const trickyAbs = "C:\\no\\such\\weird\" <x> 'y' & z.md";
+    const pinsJson = {
+        version: 1,
+        pins: [
+            { id: "p1", type: "prompt", text: "valid prompt <b>&</b>" },
+            { id: "f1", type: "file", path: ampName },
+            { id: "f2", type: "file", path: trickyAbs },
+            { id: "bad1", type: "file", path: 123 },   // non-string path -> drop
+            { id: "bad2", type: "file" },              // no path -> drop
+            { type: "prompt", text: "no id" },         // no id -> drop
+            { id: "bad3", type: "prompt" },            // no text -> drop
+            { id: "bad4", type: "unknown" },           // bad type -> drop
+            null, "string",                            // not objects -> drop
+        ],
+    };
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify(pinsJson));
+
+    let out = "";
+    let threw = false;
+    try { out = (await hooks.onUserPromptSubmitted({}, inv))?.additionalContext ?? ""; }
+    catch { threw = true; }
+
+    check("hook does not throw on a partially-corrupt pins.json", !threw);
+    check("valid prompt text is rendered", out.includes("valid prompt"));
+    check("prompt content angle brackets escaped", out.includes("&lt;b&gt;"));
+    check("readable file content is rendered", out.includes("content with"));
+    check("file content angle brackets escaped", out.includes("&lt;tag&gt;"));
+    check("'&' in path attribute is escaped", out.includes("a &amp; b.md"));
+    check("'\"' in path attribute is escaped", out.includes("&quot;"));
+    check("''' in path attribute is escaped", out.includes("&apos;"));
+    check("'<>' in path attribute is escaped", out.includes("&lt;x&gt;"));
+    check("no raw quote breaks the path attribute", !out.includes('weird" <x>'));
+    check("exactly one prompt-pin survives", (out.match(/<prompt-pin /g) || []).length === 1);
+    check("exactly two file-pins survive", (out.match(/<live-file-pin /g) || []).length === 2);
+    check("dropped-pins warning is logged", state.logs.some((m) => /dropped 7 malformed/.test(m)));
+    // Session-rooted pins must expose only their relative/display path — never the
+    // absolute session path (which would leak the home dir / username every turn).
+    check("session-rooted path is not leaked as absolute", !out.includes(state.sessionRoot));
+    check("session-rooted path shown relative in attribute", out.includes('path="a &amp; b.md"'));
+
+    // An unreadable session-rooted pin must not leak the absolute path via the
+    // error text (fs error messages embed it) — only an error code is emitted.
+    freshSession();
+    seedPins([{ id: "missing", type: "file", path: "does-not-exist.md" }]);
+    const outMissing = await render();
+    check("unreadable pin reports it could not be read", /could not be read/.test(outMissing));
+    check("unreadable pin emits an error code, not a message", /error code \w+/.test(outMissing));
+    check("unreadable pin does not leak the absolute session path", !outMissing.includes(state.sessionRoot));
+    // The every-turn preamble must tell the agent to consider pins as a possible
+    // cause when debugging, and to surface (not silently ignore) a conflicting pin.
+    check("preamble includes self-diagnostic guidance", /consider[\s\S]*whether one of these pins/i.test(out));
+    check("preamble tells the agent to surface conflicts", /surface the conflict/i.test(out));
+}
+
+// ---------------------------------------------------------------------------
+group("Non-interactive host (no elicitation UI)");
+{
+    const runPin = globalThis.__pins.commands.find((c) => c.name === "pin").handler;
+
+    // /pin add with no inline text must not throw when there's no UI to prompt.
+    freshSession();
+    state.elicitation = false;
+    let threw = false;
+    try { await runPin({ args: "add", sessionId: inv.sessionId }); } catch { threw = true; }
+    check("/pin add (no UI, no text) does not throw", !threw);
+    check("/pin add (no UI) pins nothing", readPins().length === 0);
+    check("/pin add (no UI) explains the inline form", state.logs.some((m) => /inline/i.test(m)));
+
+    // /pin edit <n> must not throw when there's no UI (editing needs a prompt).
+    freshSession();
+    state.elicitation = false;
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({ version: 1, pins: [{ id: "e1", type: "prompt", text: "editable" }] }));
+    threw = false;
+    try { await runPin({ args: "edit 1", sessionId: inv.sessionId }); } catch { threw = true; }
+    check("/pin edit N (no UI) does not throw", !threw);
+    check("/pin edit N (no UI) leaves the pin intact", readPins().some((p) => p.text === "editable"));
+    check("/pin edit N (no UI) explains it needs a prompt", state.logs.some((m) => /interactive prompt/i.test(m)));
+}
+
+// ---------------------------------------------------------------------------
+group("Concurrent first-load coalescing");
+{
+    // Seed a store on disk, then fire two adds concurrently. Both hit a fresh
+    // (uncached) session, so without load coalescing they would each parse the
+    // file into a separate store object and one add would be lost on save.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({ version: 1, pins: [{ id: "o1", type: "prompt", text: "original" }] }));
+    await Promise.all([
+        tool.pin_prompt.handler({ text: "concurrent-X" }, inv),
+        tool.pin_prompt.handler({ text: "concurrent-Y" }, inv),
+    ]);
+    const pins = readPins();
+    check("original pin is preserved", pins.some((p) => p.text === "original"));
+    check("both concurrent adds are preserved", ["concurrent-X", "concurrent-Y"].every((t) => pins.some((p) => p.text === t)));
+}
+
+// ---------------------------------------------------------------------------
+group("Durable atomic saves");
+{
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    const out = await tool.pin_prompt.handler({ text: "durable" }, inv);
+    check("save produced a pins.json", existsSync(join(state.sessionRoot, "pins.json")));
+    let ok = false;
+    try { JSON.parse(readFileSync(join(state.sessionRoot, "pins.json"), "utf8")); ok = true; } catch {}
+    check("pins.json is valid, complete JSON", ok);
+    check("pins.json ends with a trailing newline", readFileSync(join(state.sessionRoot, "pins.json"), "utf8").endsWith("\n"));
+    check("no leftover .tmp files after save", readdirSync(state.sessionRoot).every((f) => !f.endsWith(".tmp")));
+
+    // Concurrent saves must serialize without corrupting the file.
+    await Promise.all([
+        tool.pin_prompt.handler({ text: "A" }, inv),
+        tool.pin_prompt.handler({ text: "B" }, inv),
+        tool.pin_prompt.handler({ text: "C" }, inv),
+    ]);
+    let ok2 = false;
+    let pins = [];
+    try { pins = JSON.parse(readFileSync(join(state.sessionRoot, "pins.json"), "utf8")).pins; ok2 = true; } catch {}
+    check("concurrent saves leave valid JSON", ok2);
+    check("all concurrent pins are present", ["A", "B", "C"].every((t) => pins.some((p) => p.text === t)));
+}
+
+// ---------------------------------------------------------------------------
+group("Enable / disable pins");
+{
+    const runPin = globalThis.__pins.commands.find((c) => c.name === "pin").handler;
+
+    // A disabled pin is kept but never injected.
+    freshSession();
+    seedPins([
+        { id: "on1", type: "prompt", text: "active rule", enabled: true },
+        { id: "off1", type: "prompt", text: "silenced rule", enabled: false },
+    ]);
+    let out = await render();
+    check("enabled pin is injected", out.includes("active rule"));
+    check("disabled pin is NOT injected", !out.includes("silenced rule"));
+
+    // A pin with no `enabled` field is treated as enabled (backward compatible).
+    freshSession();
+    seedPins([{ id: "legacy", type: "prompt", text: "legacy rule" }]);
+    out = await render();
+    check("legacy pin (no enabled field) is injected", out.includes("legacy rule"));
+
+    // list_pins reports the state.
+    freshSession();
+    seedPins([
+        { id: "on1", type: "prompt", text: "active rule", enabled: true },
+        { id: "off1", type: "prompt", text: "silenced rule", enabled: false },
+    ]);
+    const listed = await tool.list_pins.handler({}, inv);
+    check("list_pins marks enabled pins", /\(enabled\) prompt: active rule/.test(listed));
+    check("list_pins redacts disabled pin content", /\(disabled\) prompt: \[content hidden/.test(listed));
+    check("list_pins does not expose disabled pin text", !listed.includes("silenced rule"));
+
+    // list_pins must not leak the absolute session path for a session-rooted file.
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "notes.md"), "hi");
+    seedPins([{ id: "sf", type: "file", path: "notes.md", enabled: true }]);
+    const listedFile = await tool.list_pins.handler({}, inv);
+    check("list_pins shows session file relative", listedFile.includes("file: `notes.md`"));
+    check("list_pins does not leak the absolute session path", !listedFile.includes(state.sessionRoot));
+
+    // A path containing a backtick must render as a valid, larger-fenced code span.
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "a`b.md"), "hi");
+    seedPins([{ id: "bt", type: "file", path: "a`b.md", enabled: true }]);
+    const listedBt = await tool.list_pins.handler({}, inv);
+    check("backtick path uses a larger fence (``a`b.md``)", listedBt.includes("``a`b.md``"));
+
+    // /pin list output shows the ✓ / ✗ glyphs.
+    freshSession();
+    seedPins([
+        { id: "on1", type: "prompt", text: "active rule", enabled: true },
+        { id: "off1", type: "prompt", text: "silenced rule", enabled: false },
+    ]);
+    await runPin({ args: "list", sessionId: inv.sessionId });
+    const listLog = state.logs.join("\n");
+    check("/pin list shows filled-circle glyph for enabled", listLog.includes("\u25cf"));
+    check("/pin list shows hollow-circle glyph for disabled", listLog.includes("\u25cb"));
+
+    // Pinboard toggle: pick the pin, choose Disable -> persisted + no longer
+    // injected, and the dialog returns to the list so the change is visible.
+    freshSession();
+    state.elicitation = true;
+    seedPins([{ id: "t1", type: "prompt", text: "toggle me", enabled: true }]);
+    let afterToggleOptions = null;
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")), // select the pin in the list
+        (_m, opts) => opts.find((o) => /Disable/.test(o)),  // choose Disable in the detail
+        (_m, opts) => { afterToggleOptions = opts.slice(); return null; }, // next call should be the list
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("pinboard toggle persisted enabled:false", readPins().find((p) => p.id === "t1")?.enabled === false);
+    check("toggled-off pin is not injected", !(await render()).includes("toggle me"));
+    check("dialog returns to the list after toggle", afterToggleOptions?.some((o) => o.startsWith("+")));
+}
+
+// ---------------------------------------------------------------------------
+group("Diagnostic one-shot suppression (test_without_pin)");
+{
+    // Suppress a pin -> omitted next render only -> restored the render after.
+    // (Gated: model-initiated, so it asks for confirmation first.)
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
+    check("baseline: pin is injected", (await render()).includes("suspect rule"));
+
+    const msg = await tool.test_without_pin.handler({ id: "d1" }, inv);
+    check("test_without_pin asks for confirmation", state.confirmCalls.length === 1);
+    check("test_without_pin acknowledges next-turn only", /next turn/i.test(msg));
+    check("suppressed pin omitted on the next render", !(await render()).includes("suspect rule"));
+    check("pin auto-restored on the following render", (await render()).includes("suspect rule"));
+
+    // It must NOT change the saved state (agent can't persist a disable).
+    check("saved state unchanged (still enabled)", readPins().find((p) => p.id === "d1")?.enabled !== false);
+
+    // Declined -> not suppressed.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = false;
+    seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
+    const declined = await tool.test_without_pin.handler({ id: "d1" }, inv);
+    check("test_without_pin (declined) reports the decline", /declined/i.test(declined));
+    check("test_without_pin (declined) does not suppress", (await render()).includes("suspect rule"));
+
+    // No UI -> refused without suppressing.
+    freshSession();
+    state.elicitation = false;
+    seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
+    const noUi = await tool.test_without_pin.handler({ id: "d1" }, inv);
+    check("test_without_pin (no UI) refuses", /confirmation/i.test(noUi));
+    state.elicitation = true;
+    check("test_without_pin (no UI) did not suppress", (await render()).includes("suspect rule"));
+
+    // Suppressing an unknown id is a no-op message, not a crash (before the gate).
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "d1", type: "prompt", text: "x", enabled: true }]);
+    check("unknown id is reported", /no pin with id/i.test(await tool.test_without_pin.handler({ id: "nope" }, inv)));
+
+    // Suppressing an already-disabled pin explains there's nothing to do.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "off", type: "prompt", text: "y", enabled: false }]);
+    check("already-disabled pin returns a no-op note", /already disabled/i.test(await tool.test_without_pin.handler({ id: "off" }, inv)));
+
+    // There is no agent tool that can persistently disable a pin.
+    const canPersistDisable = tools.some((t) => /disable/i.test(t.name));
+    check("no agent tool can persistently disable a pin", !canPersistDisable);
+}
+
+// ---------------------------------------------------------------------------
+group("Consent gates for pin-removing tools (unpin / clear_pins)");
+{
+    // unpin: approve -> removed; decline -> kept; no UI -> refused + kept.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "u1", type: "prompt", text: "remove me", enabled: true }]);
+    let r = await tool.unpin.handler({ id: "u1" }, inv);
+    check("unpin asks for confirmation", state.confirmCalls.length === 1);
+    check("unpin (approved) removes the pin", readPins().length === 0);
+
+    freshSession();
+    state.elicitation = true; state.confirmReturn = false;
+    seedPins([{ id: "u1", type: "prompt", text: "remove me", enabled: true }]);
+    r = await tool.unpin.handler({ id: "u1" }, inv);
+    check("unpin (declined) keeps the pin", readPins().some((p) => p.id === "u1"));
+
+    freshSession();
+    state.elicitation = false;
+    seedPins([{ id: "u1", type: "prompt", text: "remove me", enabled: true }]);
+    r = await tool.unpin.handler({ id: "u1" }, inv);
+    check("unpin (no UI) refuses", /confirmation/i.test(r));
+    check("unpin (no UI) keeps the pin", readPins().some((p) => p.id === "u1"));
+
+    // clear_pins: approve -> wiped; decline -> kept; no UI -> refused + kept.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "c1", type: "prompt", text: "a", enabled: true }, { id: "c2", type: "prompt", text: "b", enabled: true }]);
+    await tool.clear_pins.handler({}, inv);
+    check("clear_pins (approved) wipes all pins", readPins().length === 0);
+
+    freshSession();
+    state.elicitation = true; state.confirmReturn = false;
+    seedPins([{ id: "c1", type: "prompt", text: "a", enabled: true }, { id: "c2", type: "prompt", text: "b", enabled: true }]);
+    await tool.clear_pins.handler({}, inv);
+    check("clear_pins (declined) keeps all pins", readPins().length === 2);
+
+    freshSession();
+    state.elicitation = false;
+    seedPins([{ id: "c1", type: "prompt", text: "a", enabled: true }]);
+    const cr = await tool.clear_pins.handler({}, inv);
+    check("clear_pins (no UI) refuses", /confirmation/i.test(cr));
+    check("clear_pins (no UI) keeps pins", readPins().length === 1);
+}
+
+// ---------------------------------------------------------------------------
+group("Pin dialog order + pin_file path normalization");
+{
+    const runPin = globalThis.__pins.commands.find((c) => c.name === "pin").handler;
+
+    // The individual pin dialog must offer Edit, then Disable/Enable, then Delete.
+    freshSession();
+    state.elicitation = true;
+    seedPins([{ id: "o1", type: "prompt", text: "order me", enabled: true }]);
+    let detailOptions = null;
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")),          // select the pin
+        (_m, opts) => { detailOptions = opts.slice(); return null; }, // capture detail order, exit
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("pin dialog order is Edit, Disable, Delete", JSON.stringify(detailOptions) === JSON.stringify(["Edit", "Disable", "Delete"]));
+
+    // A disabled pin's dialog offers Enable (not Disable), still in the middle.
+    freshSession();
+    state.elicitation = true;
+    seedPins([{ id: "o2", type: "prompt", text: "enable me", enabled: false }]);
+    detailOptions = null;
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")),
+        (_m, opts) => { detailOptions = opts.slice(); return null; },
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("disabled pin dialog order is Edit, Enable, Delete", JSON.stringify(detailOptions) === JSON.stringify(["Edit", "Enable", "Delete"]));
+
+    // pin_file must tolerate a leading @ (or @@) on the path argument.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "note.md"), "hi");
+    await tool.pin_file.handler({ path: "@note.md" }, inv);
+    check("pin_file strips a single leading @", readPins().some((p) => p.type === "file"));
+
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "note.md"), "hi");
+    await tool.pin_file.handler({ path: "@@note.md" }, inv);
+    check("pin_file strips a doubled leading @@", readPins().some((p) => p.type === "file"));
+
+    // Bare '@' (no filename) is still rejected cleanly.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    const bare = await tool.pin_file.handler({ path: "@" }, inv);
+    check("pin_file rejects a bare @", /no file path/i.test(bare) && readPins().length === 0);
+
+    // /pin remove <n> reports the pin number in the deletion message.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([
+        { id: "a", type: "prompt", text: "first", enabled: true },
+        { id: "b", type: "prompt", text: "second", enabled: true },
+    ]);
+    await runPin({ args: "remove 2", sessionId: inv.sessionId });
+    check("delete message names the pin number", state.logs.some((m) => /Pin 2 deleted\./.test(m)));
+    check("the right pin was removed", readPins().length === 1 && readPins()[0].id === "a");
+}
+
+// ---------------------------------------------------------------------------
+group("COPILOT_HOME fallback (no workspacePath)");
+{
+    function findFile(dir, name) {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, entry.name);
+            if (entry.isDirectory()) {
+                const hit = findFile(full, name);
+                if (hit) return hit;
+            } else if (entry.name === name) {
+                return full;
+            }
+        }
+        return null;
+    }
+
+    const home = mkdtempSync(join(tmpdir(), "copilothome-"));
+    const savedEnv = process.env.COPILOT_HOME;
+    process.env.COPILOT_HOME = home;
+    freshSession();
+    state.noWorkspace = true;          // force the fallback path
+    state.elicitation = true; state.confirmReturn = true;
+    let threw = false;
+    try { await tool.pin_prompt.handler({ text: "home fallback" }, inv); } catch { threw = true; }
+    check("pin write under COPILOT_HOME did not throw", !threw);
+    const found = findFile(home, "pins.json");
+    check("pins.json is written under $COPILOT_HOME/session-state", found !== null && found.includes(join("session-state")));
+
+    // restore
+    state.noWorkspace = false;
+    if (savedEnv === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = savedEnv;
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+group("Path-traversal rejection in file pins");
+{
+    freshSession();
+    // A secret sitting just outside the session files folder.
+    writeFileSync(join(state.sessionRoot, "secret.txt"), "TOPSECRET");
+    writeFileSync(join(state.sessionRoot, "files", "ok.md"), "fine");
+    seedPins([
+        { id: "trav", type: "file", path: "../secret.txt", enabled: true },  // must be dropped
+        { id: "deep", type: "file", path: "a/../../secret.txt", enabled: true }, // must be dropped
+        { id: "ok", type: "file", path: "ok.md", enabled: true },            // must survive
+    ]);
+    const out = await render();
+    check("traversal pin content is never injected", !out.includes("TOPSECRET"));
+    check("legit relative pin still injected", out.includes("fine"));
+    const listed = await tool.list_pins.handler({}, inv);
+    check("only the safe pin survives load", listed.split("\n").length === 1 && listed.includes("[ok]"));
+    check("dropped-pins warning logged for traversal", state.logs.some((m) => /dropped 2 malformed/.test(m)));
+}
+
+// ---------------------------------------------------------------------------
+console.log(`\n${passed} passed, ${failed} failed`);
+if (state.sessionRoot) {
+    try { rmSync(state.sessionRoot, { recursive: true, force: true }); } catch {}
+}
+process.exit(failed ? 1 : 0);

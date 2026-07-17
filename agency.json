@@ -1,0 +1,9 @@
+{
+  "engines": ["copilot"],
+  "category": "developer-tools",
+  "platforms": ["windows", "linux", "macos"],
+  "authors": [
+    { "name": "Eugene Pistrak", "email": "evpistra@microsoft.com" },
+    { "name": "Matthew Calligaro", "email": "macallig@microsoft.com" }
+  ]
+}

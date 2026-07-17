@@ -1,0 +1,10 @@
+{
+  "name": "session-pins",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Copilot CLI plugin: pin editable instructions and live files into every prompt of a session.",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-loader ./test/sdk-loader.mjs ./test/run.mjs"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "session-pins",
+  "version": "1.0.0",
+  "description": "Pin editable instructions and live files into every prompt of a Copilot CLI session. Adds a /pin command and agent-callable pin tools.",
+  "author": {
+    "name": "Eugene Pistrak",
+    "email": "evpistra@microsoft.com"
+  },
+  "homepage": "https://github.com/agency-microsoft/playground/tree/main/plugins/session-pins",
+  "keywords": [
+    "copilot-cli",
+    "pin",
+    "pins",
+    "context",
+    "session",
+    "prompt",
+    "notes",
+    "productivity",
+    "extension"
+  ],
+  "postInstallMessage": "session-pins: one-time activation needed. Copilot CLI does not yet auto-load plugin extensions, so run the bundled install script once, then relaunch with --experimental:\n  Windows: `& \"$HOME\\.copilot\\installed-plugins\\agency-playground\\session-pins\\install.ps1\"`\n  macOS/Linux: `\"$HOME/.copilot/installed-plugins/agency-playground/session-pins/install.sh\"`\nThen use /pin, or just ask Copilot to pin an instruction or file."
+}
