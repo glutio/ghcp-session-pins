@@ -439,6 +439,35 @@ group("Consent gates for pin-removing tools (unpin / clear_pins)");
 }
 
 // ---------------------------------------------------------------------------
+group("unpin does not leak disabled-pin content (probing oracle)");
+{
+    // match must NOT find a disabled pin (it would be a content-probing oracle,
+    // since list_pins redacts disabled content).
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "d1", type: "prompt", text: "SECRET disabled rule", enabled: false }]);
+    let r = await tool.unpin.handler({ match: "SECRET" }, inv);
+    check("unpin match does not find a disabled pin", /no matching pin/i.test(r));
+    check("unpin match did not ask to confirm (nothing matched)", state.confirmCalls.length === 0);
+    check("disabled pin still present", readPins().some((p) => p.id === "d1"));
+
+    // match DOES still find an enabled pin.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "e1", type: "prompt", text: "visible enabled rule", enabled: true }]);
+    r = await tool.unpin.handler({ match: "visible" }, inv);
+    check("unpin match finds an enabled pin", readPins().length === 0);
+
+    // Removing a disabled pin by id must NOT echo its content back to the model.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "d2", type: "prompt", text: "SECRET disabled content", enabled: false }]);
+    r = await tool.unpin.handler({ id: "d2" }, inv);
+    check("removing a disabled pin succeeds", readPins().length === 0);
+    check("removal message does not leak disabled content", !/SECRET/.test(r) && /disabled/i.test(r) && r.includes("d2"));
+}
+
+// ---------------------------------------------------------------------------
 group("Pin dialog order + pin_file path normalization");
 {
     const runPin = globalThis.__pins.commands.find((c) => c.name === "pin").handler;

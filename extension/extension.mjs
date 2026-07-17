@@ -1086,6 +1086,13 @@ const tools = [
             } else if (args?.match) {
                 const needle = String(args.match).toLowerCase();
                 index = store.pins.findIndex((p) => {
+                    // Only substring-match ENABLED pins. Disabled pins are
+                    // content-redacted in list_pins, so letting `match` search their
+                    // text/path would turn unpin into a probing oracle for hidden
+                    // content. Disabled pins can still be removed by id or index.
+                    if (!isEnabled(p)) {
+                        return false;
+                    }
                     const hay =
                         p.type === "prompt"
                             ? p.text
@@ -1118,6 +1125,11 @@ const tools = [
 
             const [removed] = store.pins.splice(index, 1);
             await saveStore(invocation.sessionId, store);
+            // Don't echo a disabled pin's content back to the model — disabled pins
+            // are content-redacted elsewhere (list_pins), so report by id only.
+            if (!isEnabled(removed)) {
+                return `Removed disabled ${removed.type} pin [${removed.id}].`;
+            }
             return `Removed ${removed.type} pin: ${
                 removed.type === "prompt"
                     ? shortText(removed.text)
