@@ -37,9 +37,9 @@ fi
 if [[ -d "$EXT_DST" && $FORCE -eq 0 ]]; then
     echo "session-pins extension already installed at $EXT_DST (re-run with --force to overwrite)."
 else
-    rm -rf "$EXT_DST"
-    mkdir -p "$EXT_DST"
-    cp -R "$EXT_SRC/." "$EXT_DST/"
+    rm -rf -- "$EXT_DST"
+    mkdir -p -- "$EXT_DST"
+    cp -R -- "$EXT_SRC/." "$EXT_DST/"
     echo "[OK] session-pins extension installed to $EXT_DST"
 fi
 

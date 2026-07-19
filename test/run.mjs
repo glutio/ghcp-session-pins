@@ -79,6 +79,11 @@ function check(name, condition) {
 function group(name) { console.log("\n" + name); }
 
 function freshSession() {
+    // Clean up the previous throwaway session dir so the suite doesn't leave a
+    // trail of pinsess-*/pinstartup-* dirs under the OS temp folder.
+    if (state.sessionRoot) {
+        try { rmSync(state.sessionRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
     state.sessionRoot = mkdtempSync(join(tmpdir(), "pinsess-"));
     mkdirSync(join(state.sessionRoot, "files"), { recursive: true });
     state.confirmCalls.length = 0;
@@ -219,8 +224,8 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     check("unreadable pin does not leak the absolute session path", !outMissing.includes(state.sessionRoot));
     // The every-turn preamble must tell the agent to consider pins as a possible
     // cause when debugging, and to surface (not silently ignore) a conflicting pin.
-    check("preamble includes self-diagnostic guidance", /consider[\s\S]*whether one of these pins/i.test(out));
-    check("preamble tells the agent to surface conflicts", /surface the conflict/i.test(out));
+    check("preamble frames pins as deliberate", /deliberately pinned/i.test(out));
+    check("preamble tells the agent not to silently ignore a bad pin", /don't silently ignore/i.test(out) && /by its number/i.test(out));
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +336,8 @@ group("Enable / disable pins");
     const listedFile = await tool.list_pins.handler({}, inv);
     check("list_pins shows session file relative", listedFile.includes("`@notes.md`"));
     check("list_pins does not leak the absolute session path", !listedFile.includes(state.sessionRoot));
+    check("list_pins shows the per-file size", listedFile.includes("`@notes.md` (~2 B)"));
+    check("list_pins shows a running context total", /added to every prompt/.test(listedFile));
 
     // A path containing a backtick must render as a valid, larger-fenced code span.
     freshSession();
@@ -368,56 +375,11 @@ group("Enable / disable pins");
 }
 
 // ---------------------------------------------------------------------------
-group("Diagnostic one-shot suppression (test_without_pin)");
+group("Diagnostics are user-driven (no test_without_pin / suppress tool)");
 {
-    // Suppress a pin -> omitted next render only -> restored the render after.
-    // (Gated: model-initiated, so it asks for confirmation first.)
-    freshSession();
-    state.elicitation = true; state.confirmReturn = true;
-    seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
-    check("baseline: pin is injected", (await render()).includes("suspect rule"));
-
-    const msg = await tool.test_without_pin.handler({ number: 1 }, inv);
-    check("test_without_pin asks for confirmation", state.confirmCalls.length === 1);
-    check("test_without_pin acknowledges next-turn only", /next turn/i.test(msg));
-    check("suppressed pin omitted on the next render", !(await render()).includes("suspect rule"));
-    check("pin auto-restored on the following render", (await render()).includes("suspect rule"));
-
-    // It must NOT change the saved state (agent can't persist a disable).
-    check("saved state unchanged (still enabled)", readPins().find((p) => p.id === "d1")?.enabled !== false);
-
-    // Declined -> not suppressed.
-    freshSession();
-    state.elicitation = true; state.confirmReturn = false;
-    seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
-    const declined = await tool.test_without_pin.handler({ number: 1 }, inv);
-    check("test_without_pin (declined) reports the decline", /declined/i.test(declined));
-    check("test_without_pin (declined) does not suppress", (await render()).includes("suspect rule"));
-
-    // No UI -> refused without suppressing.
-    freshSession();
-    state.elicitation = false;
-    seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
-    const noUi = await tool.test_without_pin.handler({ number: 1 }, inv);
-    check("test_without_pin (no UI) refuses", /confirmation/i.test(noUi));
-    state.elicitation = true;
-    check("test_without_pin (no UI) did not suppress", (await render()).includes("suspect rule"));
-
-    // Suppressing an unknown id is a no-op message, not a crash (before the gate).
-    freshSession();
-    state.elicitation = true; state.confirmReturn = true;
-    seedPins([{ id: "d1", type: "prompt", text: "x", enabled: true }]);
-    check("unknown id is reported", /no pin #/i.test(await tool.test_without_pin.handler({ number: 99 }, inv)));
-
-    // Suppressing an already-disabled pin explains there's nothing to do.
-    freshSession();
-    state.elicitation = true; state.confirmReturn = true;
-    seedPins([{ id: "off", type: "prompt", text: "y", enabled: false }]);
-    check("already-disabled pin returns a no-op note", /already disabled/i.test(await tool.test_without_pin.handler({ number: 1 }, inv)));
-
-    // There is no agent tool that can persistently disable a pin.
-    const canPersistDisable = tools.some((t) => /disable/i.test(t.name));
-    check("no agent tool can persistently disable a pin", !canPersistDisable);
+    check("test_without_pin tool was removed", !tools.some((t) => t.name === "test_without_pin"));
+    check("no agent tool can persistently disable or suppress a pin",
+        !tools.some((t) => /disable|suppress/i.test(t.name)));
 }
 
 // ---------------------------------------------------------------------------
@@ -643,7 +605,7 @@ group("Path-traversal rejection in file pins");
     check("traversal pin content is never injected", !out.includes("TOPSECRET"));
     check("legit relative pin still injected", out.includes("fine"));
     const listed = await tool.list_pins.handler({}, inv);
-    check("only the safe pin survives load", listed.split("\n").length === 1 && listed.includes("@ok.md"));
+    check("only the safe pin survives load", (listed.match(/^\d+\. /gm) || []).length === 1 && listed.includes("@ok.md"));
     check("dropped-pins warning logged for traversal", state.logs.some((m) => /dropped 2 malformed/.test(m)));
 }
 

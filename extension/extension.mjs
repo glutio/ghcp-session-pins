@@ -22,13 +22,10 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 const stores = new Map();
-// One-shot, in-memory diagnostic suppressions: sessionId -> Set<pinId>. The agent
-// can ask (via test_without_pin) to omit a pin for just the NEXT turn to test
-// whether it's causing a problem. This is deliberately never written to pins.json
-// and is consumed (cleared) by the next render, so it can't get "stuck off" — even
-// if the agent is interrupted, the pin is active again on the following turn. Only
-// the user can persistently enable/disable a pin (via the pinboard).
-const suppressedOnce = new Map();
+// Assigned once joinSession() resolves (declared here so helpers like sessionDir
+// can reference it defensively — session?.workspacePath — without a TDZ error if
+// any SDK preflight path touches them before the session is ready).
+let session;
 // Per-path in-flight load promise. Without this, two callers hitting a fresh
 // session at the same time can both pass the `stores.has` check and each parse
 // pins.json into a separate store object; a later save on one instance would then
@@ -48,6 +45,10 @@ const PREVIEW_LENGTH = 240;
 // Max bytes of a pinned file injected into a prompt. Larger files are truncated
 // with a notice so an accidentally-pinned huge file can't blow up the context.
 const MAX_PINNED_FILE_BYTES = 64 * 1024;
+// Generous, non-blocking advisory threshold: when all active pins together add
+// more than this to every prompt, list_pins / the startup notice mention it. This
+// never blocks pinning — it's purely a heads-up about context cost.
+const SOFT_PIN_BUDGET_BYTES = 200 * 1024;
 
 // Subdirectory of the session folder (session.workspacePath) where Copilot keeps
 // session-level user files. The SDK has no getter for it — it's the documented
@@ -203,7 +204,7 @@ async function loadStore(sessionId) {
             // the bad file atomically.
             if (error?.code !== "ENOENT") {
                 await session.log(
-                    `session-pins: ignoring unreadable pin store (${error.message}); starting empty.`,
+                    `session-pins: ignoring unreadable pin store (${error?.code ?? error?.name ?? "unknown error"}); starting empty.`,
                     { level: "warning", ephemeral: true },
                 );
             }
@@ -462,6 +463,27 @@ function formatBytes(n) {
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
     return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Very rough token estimate (~4 bytes/token) for the pin-cost readout. Only used
+// for an at-a-glance "how much context do my pins cost" figure, never for limits.
+function approxTokens(bytes) {
+    return Math.ceil(bytes / 4);
+}
+
+// Approximate bytes a pin adds to each prompt: the prompt text, or the file's
+// on-disk size capped at the injection cap (larger files are truncated on inject).
+// Best-effort — an unreadable file counts as 0.
+async function pinBytes(pin, sessionId) {
+    if (pin.type === "prompt") {
+        return Buffer.byteLength(String(pin.text ?? ""), "utf8");
+    }
+    try {
+        const { size } = await stat(resolveFilePin(pin, sessionId));
+        return Math.min(size, MAX_PINNED_FILE_BYTES);
+    } catch {
+        return 0;
+    }
 }
 
 function elicitationEnabled() {
@@ -867,37 +889,13 @@ async function handlePin(ctx) {
     await addFromArgs(ctx, raw);
 }
 
-// Record a one-shot diagnostic suppression for the next turn (see suppressedOnce).
-function suppressOnce(sessionId, pinId) {
-    let set = suppressedOnce.get(sessionId);
-    if (!set) {
-        set = new Set();
-        suppressedOnce.set(sessionId, set);
-    }
-    set.add(pinId);
-}
-
-// Consume (and clear) the one-shot suppressions for a session, so they apply to a
-// single render only and then auto-restore.
-function takeSuppressed(sessionId) {
-    const set = suppressedOnce.get(sessionId);
-    if (!set) {
-        return new Set();
-    }
-    suppressedOnce.delete(sessionId);
-    return set;
-}
-
 async function renderPinnedContext(sessionId) {
     const store = await loadStore(sessionId);
-    // Consume any one-shot diagnostic suppressions for this turn, then inject only
-    // pins that are enabled and not suppressed. Disabled pins stay saved but silent.
-    const suppressed = takeSuppressed(sessionId);
     const sections = [];
     for (let i = 0; i < store.pins.length; i++) {
         const pin = store.pins[i];
-        // Skip disabled pins (saved but silenced) and one-shot-suppressed pins.
-        if (!isEnabled(pin) || suppressed.has(pin.id)) {
+        // Skip disabled pins (saved but silenced); they stay in pins.json.
+        if (!isEnabled(pin)) {
             continue;
         }
         // 1-based number matching list_pins and the /pin command, so the user and
@@ -961,22 +959,17 @@ async function renderPinnedContext(sessionId) {
 
     return [
         "<session_pins>",
-        "The user deliberately pinned the following instructions and live file contents.",
-        "Keep them salient and apply them on this turn. A live file is reread from disk for every prompt.",
-        "If you hit unexpected behavior, a conflict, or a task that keeps failing or looping, consider" +
-            " whether one of these pins is the cause — a stale, over-broad, or contradictory instruction," +
-            " or a pinned file that no longer reflects reality. When it is, tell the user which pin (by its" +
-            " number) is interfering. To test a hypothesis, call the test_without_pin tool with that number:" +
-            " it omits the pin from just your next turn (auto-restoring afterward, without changing its saved" +
-            " state), so you can re-run the failing step and compare. Offer to edit or remove a genuinely bad" +
-            " pin (via the /pin command, or the list_pins / unpin tools). Do not silently ignore a pin —" +
-            " surface the conflict instead.",
+        "The user deliberately pinned the following for this session — keep it salient and apply it on" +
+            " this turn. A live file is reread from disk every prompt.",
+        "If a pin looks stale, over-broad, or in conflict with the task, don't silently ignore it: say" +
+            " which pin (by its number) looks wrong so the user can edit, disable, or remove it via /pin" +
+            " (or the unpin tool).",
         ...sections,
         "</session_pins>",
     ].join("\n\n");
 }
 
-// Consent gate for model-initiated actions that add, remove, or suppress pins.
+// Consent gate for model-initiated actions that add or remove pins.
 // These tools are called by the model, so prompt-injection (from a file/web
 // result) could try to change the user's pins without them asking. Require an
 // explicit confirmation, and refuse when no UI is available. Returns
@@ -997,7 +990,7 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Pin a file so its FULL contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it — this persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
+            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (up to the first 64 KB is injected; larger files are truncated). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
         parameters: {
             type: "object",
             properties: {
@@ -1099,25 +1092,37 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "List the pins currently active in this Copilot session (prompt pins and live file pins), each with its number and enabled/disabled state. Enabled pins show a short preview (prompts in double quotes, files as @path); disabled pins are shown WITHOUT their content (they are intentionally silenced). Call this before removing or suppressing a specific pin so you can reference its number, or when diagnosing unexpected behavior to check whether a pinned instruction or file is interfering.",
+            "List the pins currently active in this Copilot session (prompt pins and live file pins), each with its number and enabled/disabled state. Enabled pins show a short preview (prompts in double quotes, files as @path) and, for file pins, their approximate size; a running total shows how much is added to every prompt. Disabled pins are shown WITHOUT their content (they are intentionally silenced). Call this before removing a specific pin so you can reference its number, or when diagnosing unexpected behavior to check whether a pinned instruction or file is interfering.",
         parameters: { type: "object", properties: {} },
         handler: async (_args, invocation) => {
             const store = await loadStore(invocation.sessionId);
             if (store.pins.length === 0) {
                 return "No pins are set for this session.";
             }
-            return store.pins
-                .map((pin, index) => {
-                    const head = `${index + 1}. (${isEnabled(pin) ? "enabled" : "disabled"})`;
-                    // Redact the content/path of disabled pins: the user silenced
-                    // them, so an ungated model-callable tool must not become an
-                    // exfiltration path for their contents.
-                    if (!isEnabled(pin)) {
-                        return `${head} [content hidden — pin is disabled]`;
-                    }
-                    return `${head} ${pinDescriptor(pin, invocation.sessionId)}`;
-                })
-                .join("\n");
+            const lines = [];
+            let activeBytes = 0;
+            for (let index = 0; index < store.pins.length; index++) {
+                const pin = store.pins[index];
+                const head = `${index + 1}. (${isEnabled(pin) ? "enabled" : "disabled"})`;
+                // Redact the content/path of disabled pins: the user silenced them,
+                // so an ungated model-callable tool must not become an exfiltration
+                // path for their contents. Disabled pins add nothing to prompts.
+                if (!isEnabled(pin)) {
+                    lines.push(`${head} [content hidden — pin is disabled]`);
+                    continue;
+                }
+                const bytes = await pinBytes(pin, invocation.sessionId);
+                activeBytes += bytes;
+                // Show the per-turn cost for file pins (prompt pins are tiny); the
+                // total below covers everything injected.
+                const cost = pin.type === "file" ? ` (~${formatBytes(bytes)})` : "";
+                lines.push(`${head} ${pinDescriptor(pin, invocation.sessionId)}${cost}`);
+            }
+            let footer = `\n≈ ${formatBytes(activeBytes)} (~${approxTokens(activeBytes)} tokens) added to every prompt.`;
+            if (activeBytes > SOFT_PIN_BUDGET_BYTES) {
+                footer += ` That's a lot of context — consider unpinning or disabling large pins.`;
+            }
+            return lines.join("\n") + footer;
         },
     },
     {
@@ -1223,56 +1228,9 @@ const tools = [
             return `Cleared ${count} pin${count === 1 ? "" : "s"}.`;
         },
     },
-    {
-        name: "test_without_pin",
-        skipPermission: true,
-        defer: "never",
-        description:
-            "Diagnostics only: temporarily omit ONE pin from just your NEXT turn to test whether it is causing a problem. The pin is automatically restored the turn after — this never changes the pin's saved enabled/disabled state and is never written to disk, so it cannot get 'stuck off' even if you are interrupted. Identify the pin by number (from list_pins). After calling this, re-run the failing step on your next turn and compare. Only the user can permanently enable/disable a pin (via the /pin pinboard); you cannot.",
-        parameters: {
-            type: "object",
-            properties: {
-                number: {
-                    type: "integer",
-                    description: "The 1-based pin number to omit from the next turn (from list_pins).",
-                },
-            },
-        },
-        handler: async (args, invocation) => {
-            const number = args?.number;
-            if (!Number.isInteger(number)) {
-                return "Pass the number of the pin to omit (see list_pins).";
-            }
-            const store = await loadStore(invocation.sessionId);
-            const pin = store.pins[number - 1];
-            if (!pin) {
-                return `No pin #${number}. Call list_pins to see the current pins.`;
-            }
-            if (!isEnabled(pin)) {
-                return `Pin ${number} is already disabled, so it isn't being injected — nothing to suppress.`;
-            }
-            const label = pinDescriptor(pin, invocation.sessionId);
-            // Consent gate: omitting a pin — even for one turn — can sidestep a
-            // user-pinned constraint, so a prompt-injection could use it to bypass a
-            // guardrail for a critical step. Require explicit confirmation.
-            const gate = await confirmModelAction(
-                `Allow Copilot to omit pin ${number} (${label}) from the next turn (a one-off diagnostic; it is restored afterward)?`,
-                `Refused: suppressing a pin needs confirmation, which isn't available here.`,
-            );
-            if (!gate.ok) {
-                return gate.message;
-            }
-            suppressOnce(invocation.sessionId, pin.id);
-            return (
-                `Suppressing pin ${number} (${label}) for the next turn only; it's re-injected ` +
-                "automatically afterward, and its saved state is unchanged. Re-run the failing " +
-                "step on your next turn to see whether this pin was the cause."
-            );
-        },
-    },
 ];
 
-const session = await joinSession({
+session = await joinSession({
     tools,
     commands: [
         {
@@ -1289,7 +1247,7 @@ const session = await joinSession({
                 const additionalContext = await renderPinnedContext(invocation.sessionId);
                 return additionalContext ? { additionalContext } : undefined;
             } catch (error) {
-                await session.log(`session-pins: failed to inject pins: ${error.message}`, {
+                await session.log(`session-pins: failed to inject pins: ${error?.code ?? error?.name ?? "unknown error"}`, {
                     level: "warning",
                     ephemeral: true,
                 });
@@ -1305,12 +1263,16 @@ const session = await joinSession({
 try {
     const startupStore = await loadStore(session.sessionId);
     if (startupStore.pins.length > 0) {
-        const active = startupStore.pins.filter(isEnabled).length;
-        const disabled = startupStore.pins.length - active;
+        const active = startupStore.pins.filter(isEnabled);
+        const disabled = startupStore.pins.length - active.length;
+        let activeBytes = 0;
+        for (const pin of active) {
+            activeBytes += await pinBytes(pin, session.sessionId);
+        }
         await session.log(
-            `session-pins: ${active} pin${active === 1 ? "" : "s"} active` +
+            `session-pins: ${active.length} pin${active.length === 1 ? "" : "s"} active` +
                 (disabled ? ` (${disabled} disabled)` : "") +
-                " in this session — use /pin to view or manage.",
+                `, ≈ ${formatBytes(activeBytes)} added to every prompt — use /pin to view or manage.`,
             { level: "info" },
         );
     }

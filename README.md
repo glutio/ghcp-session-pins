@@ -1,13 +1,15 @@
 # Session Pins
 
-**Pin instructions and live files so they're injected into every prompt of your Copilot CLI session.**
+**Keep a small, editable brief — rules, decisions, and key files — salient for one Copilot CLI session, without touching your repo or creating cross-session memory.**
 
-Copilot has no memory within a session beyond the rolling context. Session Pins lets you
-*stick* the things that must stay salient — a rule, a decision, or a file — so they ride along
-on every turn until you remove them.
+In a long session, the things that must stay true — a constraint, a decision you made, the file
+that's the source of truth — get buried as the conversation grows or is compacted. Session Pins
+*sticks* them so they ride along on every turn until you remove them. Unlike repository instruction
+files or `/memory`, pins are **session-scoped and ephemeral**: they travel with the session and
+vanish when it's deleted, so they never pollute your repo or persist across sessions.
 
 - **Prompt pin** — an editable instruction added to every prompt (e.g. *"don't reinvent X, follow Y.md"*).
-- **Live file pin** — a file re-read from disk on every prompt, so edits to it stay reflected automatically.
+- **Live file pin** — a file re-read from disk on every prompt, so edits to it stay reflected automatically (up to the first 64 KB is injected; larger files are truncated). Best for small, evolving docs — a plan, decisions, acceptance criteria — not large source files.
 
 Pins are stored in the **session folder** as `pins.json` — the session's workspace directory
 (`session.workspacePath`) when available, otherwise `~/.copilot/session-state/<id>/`. Either way
