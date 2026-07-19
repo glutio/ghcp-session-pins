@@ -12,8 +12,9 @@
 //   /pin remove [n]       Delete a pin.
 //   /pin clear            Delete all pins.
 //
-// Pins live inside the session folder (session.workspacePath), so they travel
-// with the session and are cleaned up when the session is deleted.
+// Pins live inside the session folder — session.workspacePath when available,
+// otherwise <COPILOT_HOME, or ~/.copilot>/session-state/<id> — so they travel with
+// the session and are cleaned up when the session is deleted.
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { randomUUID } from "node:crypto";

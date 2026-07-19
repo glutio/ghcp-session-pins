@@ -82,11 +82,11 @@ For direct, interactive control there's a single `/pin` command:
 
 In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **open** it in an editor (file pins — Copilot opens it for you), **enable/disable** it (a quick way to silence a pin without deleting it), edit it in place, or delete it; `Esc` exits.
 
-### Enabling, disabling, and diagnosing pins
+### Enabling and disabling pins
 
 A disabled pin is kept in the list but not injected into prompts — handy for temporarily silencing a rule without losing it. Only you change this state, from the pinboard.
 
-When Copilot is diagnosing a problem, it can also *test* whether a pin is the culprit: the `test_without_pin` tool omits a single pin from **just the next turn** and then restores it automatically. This is in-memory only and never written to disk, so the agent can experiment safely — it can't leave a pin "stuck off", and it can never permanently disable a pin (that's yours to control).
+Disabling doubles as the diagnostic: if a pinned rule or file seems to be causing trouble, disable it, re-run the step, and re-enable it if it wasn't the cause. Copilot will also point out (by its number) any pin that looks stale or in conflict, but only you change a pin's state or remove it.
 
 ## Alternative: force-load an instructions file from the session folder
 
