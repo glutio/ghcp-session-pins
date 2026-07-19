@@ -353,13 +353,13 @@ async function buildPin(raw, sessionId) {
         } catch (error) {
             return {
                 ok: false,
-                error: `Cannot pin ${fmtDisplayPath(absolutePath, sessionId)}: ${fsErrorReason(error)}.`,
+                error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(error)}.`,
             };
         }
         if (!info.isFile()) {
             return {
                 ok: false,
-                error: `Cannot pin ${fmtDisplayPath(absolutePath, sessionId)}: it is not a file.`,
+                error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: it isn't a file.`,
             };
         }
 
@@ -392,21 +392,21 @@ async function addPinToStore(sessionId, pin) {
     const store = await loadStore(sessionId);
     if (pin.type === "file") {
         const target = resolveFilePin(pin, sessionId);
-        const dup = store.pins.some(
+        const dupIndex = store.pins.findIndex(
             (p) => p.type === "file" && resolveFilePin(p, sessionId) === target,
         );
-        if (dup) {
-            return { added: false, message: `Already pinned live: ${fileLabel(pin, sessionId)}` };
+        if (dupIndex >= 0) {
+            return {
+                added: false,
+                message: `Already pinned as pin ${dupIndex + 1}: ${pinDescriptor(store.pins[dupIndex], sessionId)}.`,
+            };
         }
     }
     store.pins.push(pin);
     await saveStore(sessionId, store);
     return {
         added: true,
-        message:
-            pin.type === "file"
-                ? `Pinned live file: ${fileLabel(pin, sessionId)}`
-                : `Pinned prompt: ${shortText(pin.text)}`,
+        message: `Pinned pin ${store.pins.length}: ${pinDescriptor(pin, sessionId)}.`,
     };
 }
 
@@ -423,25 +423,9 @@ function fmtPath(p) {
     return `${fence}${pad}${value}${pad}${fence}`;
 }
 
-// A file pin's label for status messages and tool results: the stored/display
-// path (relative for session-rooted pins, absolute for files outside the
-// session), matching the pinboard and avoiding leaking the home dir/username into
-// model-visible output for session-rooted pins.
-function fileLabel(pin, sessionId) {
-    return fmtDisplayPath(resolveFilePin(pin, sessionId), sessionId);
-}
-
-// The single place that turns a resolved *absolute* path into safe, display-ready
-// text: apply the session-rooted display transform (relative inside the session,
-// absolute outside), then backtick-wrap. Every user- and model-facing path string
-// must go through this (or fileLabel / pinPathDisplay) so no call site can
-// accidentally leak the session/home absolute path for a session-rooted file.
-function fmtDisplayPath(absolutePath, sessionId) {
-    return fmtPath(toStoredPath(absolutePath, sessionId));
-}
-
 // The display path of a file pin, without formatting (for the pinboard and picker
-// labels that add their own `@` prefix).
+// labels that add their own `@` prefix). Returns a session-relative path for files
+// inside <session>/files, absolute only for files that genuinely live elsewhere.
 function pinPathDisplay(pin, sessionId) {
     return toStoredPath(resolveFilePin(pin, sessionId), sessionId);
 }
@@ -452,6 +436,23 @@ function pinPathDisplay(pin, sessionId) {
 // error code.
 function fsErrorReason(error) {
     return error?.code ? `error code ${error.code}` : "an unknown error";
+}
+
+// One consistent way to describe a pin in a message: a prompt shows as its text in
+// double quotes, a file shows as `@path` — matching how you type `/pin add @path`
+// and the pinboard labels. Paths go through fmtPath so spaces/backticks stay safe,
+// and through the session-rooted display transform so the absolute session/home
+// path is never leaked for a session-rooted file.
+function pinDescriptor(pin, sessionId) {
+    return pin.type === "prompt"
+        ? `"${shortText(pin.text)}"`
+        : fmtPath(`@${pinPathDisplay(pin, sessionId)}`);
+}
+
+// The `@path` descriptor for a file given its absolute path (used before the pin is
+// built/stored). Same display transform, so no absolute-path leak.
+function fileDescriptor(absolutePath, sessionId) {
+    return fmtPath(`@${toStoredPath(absolutePath, sessionId)}`);
 }
 
 function elicitationEnabled() {
@@ -526,7 +527,7 @@ async function editPin(ctx, store, index) {
         }
         pin.text = text;
         await saveStore(ctx.sessionId, store);
-        await session.log(`Updated prompt pin: ${shortText(text)}`, { level: "info" });
+        await session.log(`Updated pin ${index + 1}: "${shortText(text)}".`, { level: "info" });
         return;
     }
 
@@ -553,7 +554,7 @@ async function editPin(ctx, store, index) {
         (p) => p !== pin && p.type === "file" && resolveFilePin(p, ctx.sessionId) === absolutePath,
     );
     if (duplicate) {
-        await session.log(`That file is already pinned: ${fmtDisplayPath(absolutePath, ctx.sessionId)}`, { level: "info" });
+        await session.log(`Already pinned: ${fileDescriptor(absolutePath, ctx.sessionId)}.`, { level: "info" });
         return;
     }
 
@@ -561,17 +562,17 @@ async function editPin(ctx, store, index) {
     try {
         info = await stat(absolutePath);
     } catch (error) {
-        await session.log(`Cannot pin ${fmtDisplayPath(absolutePath, ctx.sessionId)}: ${fsErrorReason(error)}.`, { level: "error" });
+        await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: ${fsErrorReason(error)}.`, { level: "error" });
         return;
     }
     if (!info.isFile()) {
-        await session.log(`Cannot pin ${fmtDisplayPath(absolutePath, ctx.sessionId)}: it is not a file.`, { level: "error" });
+        await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: it isn't a file.`, { level: "error" });
         return;
     }
 
     pin.path = toStoredPath(absolutePath, ctx.sessionId);
     await saveStore(ctx.sessionId, store);
-    await session.log(`Updated live file pin: ${fmtDisplayPath(absolutePath, ctx.sessionId)}`, { level: "info" });
+    await session.log(`Updated pin ${index + 1}: ${fileDescriptor(absolutePath, ctx.sessionId)}.`, { level: "info" });
 }
 
 async function deletePin(ctx, store, index) {
@@ -580,14 +581,14 @@ async function deletePin(ctx, store, index) {
         return false;
     }
     if (elicitationEnabled()) {
-        const confirmed = await session.ui.confirm(`Delete ${pinLabel(pin, index, ctx.sessionId)}?`);
+        const confirmed = await session.ui.confirm(`Unpin pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}?`);
         if (!confirmed) {
             return false;
         }
     }
     store.pins.splice(index, 1);
     await saveStore(ctx.sessionId, store);
-    await session.log(`Pin ${index + 1} deleted.`, { level: "info" });
+    await session.log(`Unpinned pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}.`, { level: "info" });
     return true;
 }
 
@@ -759,7 +760,7 @@ async function clearPins(ctx) {
         return;
     }
     if (elicitationEnabled()) {
-        const confirmed = await session.ui.confirm(`Delete all ${store.pins.length} session pins?`);
+        const confirmed = await session.ui.confirm(`Clear all ${store.pins.length} pins?`);
         if (!confirmed) {
             return;
         }
@@ -767,7 +768,7 @@ async function clearPins(ctx) {
     const count = store.pins.length;
     store.pins = [];
     await saveStore(ctx.sessionId, store);
-    await session.log(`Cleared ${count} session pin${count === 1 ? "" : "s"}.`, { level: "info" });
+    await session.log(`Cleared ${count} pin${count === 1 ? "" : "s"}.`, { level: "info" });
 }
 
 async function showHelp() {
@@ -1057,7 +1058,7 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "List the pins currently active in this Copilot session (prompt pins and live file pins), each with its id, type, and enabled/disabled state. Enabled pins show a short content/path preview; disabled pins are shown WITHOUT their content (they are intentionally silenced). Call this before removing or suppressing a specific pin so you can reference its id, or when diagnosing unexpected behavior to check whether a pinned instruction or file is interfering.",
+            "List the pins currently active in this Copilot session (prompt pins and live file pins), each with its number and enabled/disabled state. Enabled pins show a short preview (prompts in double quotes, files as @path); disabled pins are shown WITHOUT their content (they are intentionally silenced). Call this before removing or suppressing a specific pin so you can reference its number, or when diagnosing unexpected behavior to check whether a pinned instruction or file is interfering.",
         parameters: { type: "object", properties: {} },
         handler: async (_args, invocation) => {
             const store = await loadStore(invocation.sessionId);
@@ -1066,16 +1067,14 @@ const tools = [
             }
             return store.pins
                 .map((pin, index) => {
-                    const head = `${index + 1}. [${pin.id}] (${isEnabled(pin) ? "enabled" : "disabled"}) ${pin.type}`;
+                    const head = `${index + 1}. (${isEnabled(pin) ? "enabled" : "disabled"})`;
                     // Redact the content/path of disabled pins: the user silenced
                     // them, so an ungated model-callable tool must not become an
                     // exfiltration path for their contents.
                     if (!isEnabled(pin)) {
-                        return `${head}: [content hidden — pin is disabled]`;
+                        return `${head} [content hidden — pin is disabled]`;
                     }
-                    return pin.type === "prompt"
-                        ? `${head}: ${shortText(pin.text)}`
-                        : `${head}: ${fileLabel(pin, invocation.sessionId)}`;
+                    return `${head} ${pinDescriptor(pin, invocation.sessionId)}`;
                 })
                 .join("\n");
         },
@@ -1085,14 +1084,13 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Remove ONE pin from this Copilot session, identified by its id (preferred), its 1-based number from list_pins, or a text/path substring to match. Call list_pins first to get ids. Use when the user asks to remove or unpin a specific pin.",
+            "Remove ONE pin from this Copilot session, identified by its 1-based number from list_pins, or a text/path substring to match. Call list_pins first. Use when the user asks to remove or unpin a specific pin.",
         parameters: {
             type: "object",
             properties: {
-                id: { type: "string", description: "The pin id to remove (from list_pins)." },
-                index: {
+                number: {
                     type: "integer",
-                    description: "1-based position of the pin as shown by list_pins.",
+                    description: "1-based pin number as shown by list_pins.",
                 },
                 match: {
                     type: "string",
@@ -1108,17 +1106,15 @@ const tools = [
             }
 
             let index = -1;
-            if (args?.id) {
-                index = store.pins.findIndex((p) => p.id === args.id);
-            } else if (Number.isInteger(args?.index)) {
-                index = args.index - 1;
+            if (Number.isInteger(args?.number)) {
+                index = args.number - 1;
             } else if (args?.match) {
                 const needle = String(args.match).toLowerCase();
                 index = store.pins.findIndex((p) => {
                     // Only substring-match ENABLED pins. Disabled pins are
                     // content-redacted in list_pins, so letting `match` search their
                     // text/path would turn unpin into a probing oracle for hidden
-                    // content. Disabled pins can still be removed by id or index.
+                    // content. Disabled pins can still be removed by number.
                     if (!isEnabled(p)) {
                         return false;
                     }
@@ -1129,7 +1125,7 @@ const tools = [
                     return hay.toLowerCase().includes(needle);
                 });
             } else {
-                return "Specify which pin to remove by id, index, or match. Call list_pins first.";
+                return "Specify which pin to remove by number or match. Call list_pins first.";
             }
 
             if (index < 0 || index >= store.pins.length) {
@@ -1137,15 +1133,12 @@ const tools = [
             }
 
             const victim = store.pins[index];
-            const victimLabel =
-                victim.type === "prompt"
-                    ? shortText(victim.text)
-                    : fileLabel(victim, invocation.sessionId);
+            const victimLabel = pinDescriptor(victim, invocation.sessionId);
             // Consent gate: this tool is model-initiated, so a prompt-injection could
             // try to silently delete a user's pinned guardrail. Require explicit
             // confirmation, and refuse when no UI is available.
             const gate = await confirmModelAction(
-                `Allow Copilot to remove this ${victim.type} pin?\n${victimLabel}`,
+                `Allow Copilot to unpin pin ${index + 1} (${victimLabel})?`,
                 `Refused: removing a pin needs confirmation, which isn't available here. The user can remove it with /pin remove.`,
             );
             if (!gate.ok) {
@@ -1155,15 +1148,11 @@ const tools = [
             const [removed] = store.pins.splice(index, 1);
             await saveStore(invocation.sessionId, store);
             // Don't echo a disabled pin's content back to the model — disabled pins
-            // are content-redacted elsewhere (list_pins), so report by id only.
+            // are content-redacted elsewhere (list_pins), so report by number only.
             if (!isEnabled(removed)) {
-                return `Removed disabled ${removed.type} pin [${removed.id}].`;
+                return `Unpinned pin ${index + 1} (disabled).`;
             }
-            return `Removed ${removed.type} pin: ${
-                removed.type === "prompt"
-                    ? shortText(removed.text)
-                    : fileLabel(removed, invocation.sessionId)
-            }`;
+            return `Unpinned pin ${index + 1}: ${victimLabel}.`;
         },
     },
     {
@@ -1182,7 +1171,7 @@ const tools = [
             // Consent gate: model-initiated wipe of every pin — a prompt-injection
             // could use it to erase all of the user's pinned guardrails at once.
             const gate = await confirmModelAction(
-                `Allow Copilot to remove ALL ${count} session pin${count === 1 ? "" : "s"}?`,
+                `Allow Copilot to clear all ${count} pin${count === 1 ? "" : "s"}?`,
                 `Refused: clearing all pins needs confirmation, which isn't available here. The user can clear them with /pin clear.`,
             );
             if (!gate.ok) {
@@ -1198,47 +1187,44 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Diagnostics only: temporarily omit ONE pin from just your NEXT turn to test whether it is causing a problem. The pin is automatically restored the turn after — this never changes the pin's saved enabled/disabled state and is never written to disk, so it cannot get 'stuck off' even if you are interrupted. Identify the pin by id (from list_pins). After calling this, re-run the failing step on your next turn and compare. Only the user can permanently enable/disable a pin (via the /pin pinboard); you cannot.",
+            "Diagnostics only: temporarily omit ONE pin from just your NEXT turn to test whether it is causing a problem. The pin is automatically restored the turn after — this never changes the pin's saved enabled/disabled state and is never written to disk, so it cannot get 'stuck off' even if you are interrupted. Identify the pin by number (from list_pins). After calling this, re-run the failing step on your next turn and compare. Only the user can permanently enable/disable a pin (via the /pin pinboard); you cannot.",
         parameters: {
             type: "object",
             properties: {
-                id: {
-                    type: "string",
-                    description: "The id of the pin to omit from the next turn (from list_pins).",
+                number: {
+                    type: "integer",
+                    description: "The 1-based pin number to omit from the next turn (from list_pins).",
                 },
             },
         },
         handler: async (args, invocation) => {
-            const id = String(args?.id ?? "").trim();
-            if (!id) {
-                return "Pass the id of the pin to omit (see list_pins).";
+            const number = args?.number;
+            if (!Number.isInteger(number)) {
+                return "Pass the number of the pin to omit (see list_pins).";
             }
             const store = await loadStore(invocation.sessionId);
-            const pin = store.pins.find((p) => p.id === id);
+            const pin = store.pins[number - 1];
             if (!pin) {
-                return `No pin with id ${id}. Call list_pins to see the current pins.`;
+                return `No pin #${number}. Call list_pins to see the current pins.`;
             }
             if (!isEnabled(pin)) {
-                return `Pin ${id} is already disabled, so it isn't being injected — nothing to suppress.`;
+                return `Pin ${number} is already disabled, so it isn't being injected — nothing to suppress.`;
             }
-            const label =
-                pin.type === "prompt"
-                    ? shortText(pin.text)
-                    : fileLabel(pin, invocation.sessionId);
+            const label = pinDescriptor(pin, invocation.sessionId);
             // Consent gate: omitting a pin — even for one turn — can sidestep a
             // user-pinned constraint, so a prompt-injection could use it to bypass a
             // guardrail for a critical step. Require explicit confirmation.
             const gate = await confirmModelAction(
-                `Allow Copilot to omit this ${pin.type} pin from the next turn (a one-off diagnostic; it is restored afterward)?\n${label}`,
+                `Allow Copilot to omit pin ${number} (${label}) from the next turn (a one-off diagnostic; it is restored afterward)?`,
                 `Refused: suppressing a pin needs confirmation, which isn't available here.`,
             );
             if (!gate.ok) {
                 return gate.message;
             }
-            suppressOnce(invocation.sessionId, id);
+            suppressOnce(invocation.sessionId, pin.id);
             return (
-                `Will omit pin ${id} (${label}) from your NEXT turn only; it is automatically ` +
-                "re-injected the turn after, and its saved state is unchanged. Re-run the failing " +
+                `Suppressing pin ${number} (${label}) for the next turn only; it's re-injected ` +
+                "automatically afterward, and its saved state is unchanged. Re-run the failing " +
                 "step on your next turn to see whether this pin was the cause."
             );
         },

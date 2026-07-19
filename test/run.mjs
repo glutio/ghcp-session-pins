@@ -94,6 +94,7 @@ group("Consent gates (model-initiated pins)");
     let out = await tool.pin_prompt.handler({ text: "always run tests" }, inv);
     check("pin_prompt asks for confirmation", state.confirmCalls.length === 1);
     check("pin_prompt (approved) persists the pin", readPins().some((p) => p.text === "always run tests"));
+    check("pin_prompt (approved) uses unified voice", /^Pinned pin 1: "always run tests"\.$/.test(out));
 
     // pin_prompt: decline
     freshSession();
@@ -116,6 +117,7 @@ group("Consent gates (model-initiated pins)");
     out = await tool.pin_file.handler({ path: "note.md" }, inv);
     check("pin_file asks for confirmation", state.confirmCalls.length === 1);
     check("pin_file (approved) persists the pin", readPins().some((p) => p.type === "file"));
+    check("pin_file (approved) uses unified voice (@path)", /^Pinned pin 1: /.test(out) && out.includes("@note.md"));
 
     // pin_file: decline
     freshSession();
@@ -293,8 +295,8 @@ group("Enable / disable pins");
         { id: "off1", type: "prompt", text: "silenced rule", enabled: false },
     ]);
     const listed = await tool.list_pins.handler({}, inv);
-    check("list_pins marks enabled pins", /\(enabled\) prompt: active rule/.test(listed));
-    check("list_pins redacts disabled pin content", /\(disabled\) prompt: \[content hidden/.test(listed));
+    check("list_pins marks enabled pins", /\(enabled\) "active rule"/.test(listed));
+    check("list_pins redacts disabled pin content", /\(disabled\) \[content hidden/.test(listed));
     check("list_pins does not expose disabled pin text", !listed.includes("silenced rule"));
 
     // list_pins must not leak the absolute session path for a session-rooted file.
@@ -302,7 +304,7 @@ group("Enable / disable pins");
     writeFileSync(join(state.sessionRoot, "files", "notes.md"), "hi");
     seedPins([{ id: "sf", type: "file", path: "notes.md", enabled: true }]);
     const listedFile = await tool.list_pins.handler({}, inv);
-    check("list_pins shows session file relative", listedFile.includes("file: `notes.md`"));
+    check("list_pins shows session file relative", listedFile.includes("`@notes.md`"));
     check("list_pins does not leak the absolute session path", !listedFile.includes(state.sessionRoot));
 
     // A path containing a backtick must render as a valid, larger-fenced code span.
@@ -310,7 +312,7 @@ group("Enable / disable pins");
     writeFileSync(join(state.sessionRoot, "files", "a`b.md"), "hi");
     seedPins([{ id: "bt", type: "file", path: "a`b.md", enabled: true }]);
     const listedBt = await tool.list_pins.handler({}, inv);
-    check("backtick path uses a larger fence (``a`b.md``)", listedBt.includes("``a`b.md``"));
+    check("backtick path uses a larger fence (``@a`b.md``)", listedBt.includes("``@a`b.md``"));
 
     // /pin list output shows the ✓ / ✗ glyphs.
     freshSession();
@@ -350,7 +352,7 @@ group("Diagnostic one-shot suppression (test_without_pin)");
     seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
     check("baseline: pin is injected", (await render()).includes("suspect rule"));
 
-    const msg = await tool.test_without_pin.handler({ id: "d1" }, inv);
+    const msg = await tool.test_without_pin.handler({ number: 1 }, inv);
     check("test_without_pin asks for confirmation", state.confirmCalls.length === 1);
     check("test_without_pin acknowledges next-turn only", /next turn/i.test(msg));
     check("suppressed pin omitted on the next render", !(await render()).includes("suspect rule"));
@@ -363,7 +365,7 @@ group("Diagnostic one-shot suppression (test_without_pin)");
     freshSession();
     state.elicitation = true; state.confirmReturn = false;
     seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
-    const declined = await tool.test_without_pin.handler({ id: "d1" }, inv);
+    const declined = await tool.test_without_pin.handler({ number: 1 }, inv);
     check("test_without_pin (declined) reports the decline", /declined/i.test(declined));
     check("test_without_pin (declined) does not suppress", (await render()).includes("suspect rule"));
 
@@ -371,7 +373,7 @@ group("Diagnostic one-shot suppression (test_without_pin)");
     freshSession();
     state.elicitation = false;
     seedPins([{ id: "d1", type: "prompt", text: "suspect rule", enabled: true }]);
-    const noUi = await tool.test_without_pin.handler({ id: "d1" }, inv);
+    const noUi = await tool.test_without_pin.handler({ number: 1 }, inv);
     check("test_without_pin (no UI) refuses", /confirmation/i.test(noUi));
     state.elicitation = true;
     check("test_without_pin (no UI) did not suppress", (await render()).includes("suspect rule"));
@@ -380,13 +382,13 @@ group("Diagnostic one-shot suppression (test_without_pin)");
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
     seedPins([{ id: "d1", type: "prompt", text: "x", enabled: true }]);
-    check("unknown id is reported", /no pin with id/i.test(await tool.test_without_pin.handler({ id: "nope" }, inv)));
+    check("unknown id is reported", /no pin #/i.test(await tool.test_without_pin.handler({ number: 99 }, inv)));
 
     // Suppressing an already-disabled pin explains there's nothing to do.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
     seedPins([{ id: "off", type: "prompt", text: "y", enabled: false }]);
-    check("already-disabled pin returns a no-op note", /already disabled/i.test(await tool.test_without_pin.handler({ id: "off" }, inv)));
+    check("already-disabled pin returns a no-op note", /already disabled/i.test(await tool.test_without_pin.handler({ number: 1 }, inv)));
 
     // There is no agent tool that can persistently disable a pin.
     const canPersistDisable = tools.some((t) => /disable/i.test(t.name));
@@ -400,20 +402,21 @@ group("Consent gates for pin-removing tools (unpin / clear_pins)");
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
     seedPins([{ id: "u1", type: "prompt", text: "remove me", enabled: true }]);
-    let r = await tool.unpin.handler({ id: "u1" }, inv);
+    let r = await tool.unpin.handler({ number: 1 }, inv);
     check("unpin asks for confirmation", state.confirmCalls.length === 1);
     check("unpin (approved) removes the pin", readPins().length === 0);
+    check("unpin (approved) uses unified voice", /^Unpinned pin 1: "remove me"\.$/.test(r));
 
     freshSession();
     state.elicitation = true; state.confirmReturn = false;
     seedPins([{ id: "u1", type: "prompt", text: "remove me", enabled: true }]);
-    r = await tool.unpin.handler({ id: "u1" }, inv);
+    r = await tool.unpin.handler({ number: 1 }, inv);
     check("unpin (declined) keeps the pin", readPins().some((p) => p.id === "u1"));
 
     freshSession();
     state.elicitation = false;
     seedPins([{ id: "u1", type: "prompt", text: "remove me", enabled: true }]);
-    r = await tool.unpin.handler({ id: "u1" }, inv);
+    r = await tool.unpin.handler({ number: 1 }, inv);
     check("unpin (no UI) refuses", /confirmation/i.test(r));
     check("unpin (no UI) keeps the pin", readPins().some((p) => p.id === "u1"));
 
@@ -421,8 +424,9 @@ group("Consent gates for pin-removing tools (unpin / clear_pins)");
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
     seedPins([{ id: "c1", type: "prompt", text: "a", enabled: true }, { id: "c2", type: "prompt", text: "b", enabled: true }]);
-    await tool.clear_pins.handler({}, inv);
+    const cleared = await tool.clear_pins.handler({}, inv);
     check("clear_pins (approved) wipes all pins", readPins().length === 0);
+    check("clear_pins (approved) uses unified voice", /^Cleared 2 pins\.$/.test(cleared));
 
     freshSession();
     state.elicitation = true; state.confirmReturn = false;
@@ -462,9 +466,9 @@ group("unpin does not leak disabled-pin content (probing oracle)");
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
     seedPins([{ id: "d2", type: "prompt", text: "SECRET disabled content", enabled: false }]);
-    r = await tool.unpin.handler({ id: "d2" }, inv);
+    r = await tool.unpin.handler({ number: 1 }, inv);
     check("removing a disabled pin succeeds", readPins().length === 0);
-    check("removal message does not leak disabled content", !/SECRET/.test(r) && /disabled/i.test(r) && r.includes("d2"));
+    check("removal message does not leak disabled content", !/SECRET/.test(r) && /disabled/i.test(r) && /pin 1/i.test(r));
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +537,7 @@ group("Pin dialog order + pin_file path normalization");
         { id: "b", type: "prompt", text: "second", enabled: true },
     ]);
     await runPin({ args: "remove 2", sessionId: inv.sessionId });
-    check("delete message names the pin number", state.logs.some((m) => /Pin 2 deleted\./.test(m)));
+    check("delete message names the pin number", state.logs.some((m) => /Unpinned pin 2:/.test(m)));
     check("the right pin was removed", readPins().length === 1 && readPins()[0].id === "a");
 }
 
@@ -587,7 +591,7 @@ group("Path-traversal rejection in file pins");
     check("traversal pin content is never injected", !out.includes("TOPSECRET"));
     check("legit relative pin still injected", out.includes("fine"));
     const listed = await tool.list_pins.handler({}, inv);
-    check("only the safe pin survives load", listed.split("\n").length === 1 && listed.includes("[ok]"));
+    check("only the safe pin survives load", listed.split("\n").length === 1 && listed.includes("@ok.md"));
     check("dropped-pins warning logged for traversal", state.logs.some((m) => /dropped 2 malformed/.test(m)));
 }
 
