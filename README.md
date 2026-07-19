@@ -78,7 +78,7 @@ For direct, interactive control there's a single `/pin` command:
 /pin clear            Remove all
 ```
 
-In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **enable/disable** it (a quick way to silence a pin without deleting it), edit it in place, or delete it; `Esc` exits.
+In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **open** it in an editor (file pins — Copilot opens it for you), **enable/disable** it (a quick way to silence a pin without deleting it), edit it in place, or delete it; `Esc` exits.
 
 ### Enabling, disabling, and diagnosing pins
 

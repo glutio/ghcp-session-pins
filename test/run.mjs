@@ -19,6 +19,7 @@ const state = {
     confirmReturn: true,
     confirmCalls: [],
     logs: [],
+    sentMessages: [],
     // Queue of responders for the interactive picker (choose -> session.ui.elicitation).
     // Each responder gets (message, options) and returns the option to pick, or null.
     // When the queue is exhausted, the picker is cancelled (returns null).
@@ -44,6 +45,7 @@ globalThis.__pins = {
             },
         },
         async log(message) { state.logs.push(message); },
+        async send(prompt) { state.sentMessages.push(prompt); return "mock-message-id"; },
     },
 };
 
@@ -81,6 +83,7 @@ function freshSession() {
     mkdirSync(join(state.sessionRoot, "files"), { recursive: true });
     state.confirmCalls.length = 0;
     state.logs.length = 0;
+    state.sentMessages.length = 0;
     state.elicitResponders.length = 0;
     state.noWorkspace = false;
     return state.sessionRoot;
@@ -521,6 +524,33 @@ group("Pin dialog order + pin_file path normalization");
     ];
     await runPin({ args: "", sessionId: inv.sessionId });
     check("disabled pin dialog order is Edit, Enable, Delete", JSON.stringify(detailOptions) === JSON.stringify(["Edit", "Enable", "Delete"]));
+
+    // A file pin's dialog offers Open first, to open the file in an editor.
+    freshSession();
+    state.elicitation = true;
+    writeFileSync(join(state.sessionRoot, "files", "doc.md"), "hi");
+    seedPins([{ id: "fo", type: "file", path: "doc.md", enabled: true }]);
+    detailOptions = null;
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")),
+        (_m, opts) => { detailOptions = opts.slice(); return null; },
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("file pin dialog order is Open, Edit, Disable, Delete", JSON.stringify(detailOptions) === JSON.stringify(["Open", "Edit", "Disable", "Delete"]));
+
+    // Selecting Open hands the file to the agent (session.send) and exits, without
+    // changing the pin.
+    freshSession();
+    state.elicitation = true;
+    writeFileSync(join(state.sessionRoot, "files", "doc.md"), "hi");
+    seedPins([{ id: "fo2", type: "file", path: "doc.md", enabled: true }]);
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")),
+        (_m, opts) => opts.find((o) => o === "Open"),
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("Open asks the agent to open the file", state.sentMessages.some((m) => /open this file in an editor/i.test(m) && m.includes("doc.md")));
+    check("Open leaves the pin unchanged", readPins().length === 1 && readPins()[0].id === "fo2");
 
     // pin_file must tolerate a leading @ (or @@) on the path argument.
     freshSession();

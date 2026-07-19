@@ -645,10 +645,26 @@ async function openPinboard(ctx) {
                     ? selected.text
                     : `@${pinPathDisplay(selected, ctx.sessionId)}`;
             const toggleLabel = isEnabled(selected) ? "Disable" : "Enable";
-            const action = await choose(detail, ["Edit", toggleLabel, "Delete"]);
+            // "Open" (file pins only) hands the file off to the agent to open in an
+            // editor however it chooses; a prompt pin has no file to open.
+            const options =
+                selected.type === "file"
+                    ? ["Open", "Edit", toggleLabel, "Delete"]
+                    : ["Edit", toggleLabel, "Delete"];
+            const action = await choose(detail, options);
 
             if (action === null) {
                 break;
+            }
+            if (action === "Open") {
+                const target = resolveFilePin(selected, ctx.sessionId);
+                await session.send(`Open this file in an editor: ${target}`);
+                await session.log(
+                    `Asked Copilot to open pin ${index + 1}: ${pinDescriptor(selected, ctx.sessionId)}.`,
+                    { level: "info" },
+                );
+                // Close the pinboard so the agent can act on the open request.
+                return;
             }
             if (action === toggleLabel) {
                 selected.enabled = !isEnabled(selected);
