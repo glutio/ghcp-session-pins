@@ -27,6 +27,7 @@ const state = {
 
 globalThis.__pins = {
     session: {
+        sessionId: "test-session",
         get workspacePath() { return state.noWorkspace ? undefined : state.sessionRoot; },
         get capabilities() { return { ui: state.elicitation ? { elicitation: true } : {} }; },
         ui: {
@@ -46,8 +47,18 @@ globalThis.__pins = {
     },
 };
 
+// Seed a session with pins BEFORE loading the extension so its one-time startup
+// pin-count notice fires against a known store and can be asserted below.
+state.sessionRoot = mkdtempSync(join(tmpdir(), "pinstartup-"));
+mkdirSync(join(state.sessionRoot, "files"), { recursive: true });
+writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({ version: 1, pins: [
+    { id: "s1", type: "prompt", text: "startup rule", enabled: true },
+    { id: "s2", type: "prompt", text: "silenced", enabled: false },
+] }));
+
 // Import the real extension (loader maps the SDK specifier to sdk-mock.mjs).
 await import(new URL("../extension/extension.mjs", import.meta.url));
+const startupLogs = [...state.logs];
 const { tools, hooks } = globalThis.__pins;
 const tool = Object.fromEntries(tools.map((t) => [t.name, t]));
 const inv = { sessionId: "test-session" };
@@ -83,6 +94,15 @@ function seedPins(pins) {
 }
 async function render() {
     return (await hooks.onUserPromptSubmitted({}, inv))?.additionalContext ?? "";
+}
+
+// ---------------------------------------------------------------------------
+group("Startup pin-count notice");
+{
+    check("startup notice reports active + disabled counts",
+        startupLogs.some((m) => /1 pin active \(1 disabled\)/.test(m)));
+    check("startup notice points to /pin",
+        startupLogs.some((m) => /session-pins:.*\/pin/.test(m)));
 }
 
 // ---------------------------------------------------------------------------
@@ -177,8 +197,9 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     check("''' in path attribute is escaped", out.includes("&apos;"));
     check("'<>' in path attribute is escaped", out.includes("&lt;x&gt;"));
     check("no raw quote breaks the path attribute", !out.includes('weird" <x>'));
-    check("exactly one prompt-pin survives", (out.match(/<prompt-pin /g) || []).length === 1);
-    check("exactly two file-pins survive", (out.match(/<live-file-pin /g) || []).length === 2);
+    check("exactly one prompt-pin survives", (out.match(/<prompt_pin /g) || []).length === 1);
+    check("exactly two file-pins survive", (out.match(/<live_file_pin /g) || []).length === 2);
+    check("injected pins are numbered, not guid-identified", /<prompt_pin number="\d+">/.test(out) && !/ id=/.test(out));
     check("dropped-pins warning is logged", state.logs.some((m) => /dropped 7 malformed/.test(m)));
     // Session-rooted pins must expose only their relative/display path — never the
     // absolute session path (which would leak the home dir / username every turn).

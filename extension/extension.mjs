@@ -269,7 +269,7 @@ function shortText(text, maxLength = PREVIEW_LENGTH) {
 }
 
 // Escape XML metacharacters so pinned text/file contents can't break out of the
-// <prompt-pin> / <live-file-pin> wrapper boundaries (defense against a pinned
+// <prompt_pin> / <live_file_pin> wrapper boundaries (defense against a pinned
 // file that contains a literal closing tag being used for prompt-injection).
 function escapeXml(text) {
     return String(text)
@@ -877,15 +877,18 @@ async function renderPinnedContext(sessionId) {
     // Consume any one-shot diagnostic suppressions for this turn, then inject only
     // pins that are enabled and not suppressed. Disabled pins stay saved but silent.
     const suppressed = takeSuppressed(sessionId);
-    const activePins = store.pins.filter((pin) => isEnabled(pin) && !suppressed.has(pin.id));
-    if (activePins.length === 0) {
-        return undefined;
-    }
-
     const sections = [];
-    for (const pin of activePins) {
+    for (let i = 0; i < store.pins.length; i++) {
+        const pin = store.pins[i];
+        // Skip disabled pins (saved but silenced) and one-shot-suppressed pins.
+        if (!isEnabled(pin) || suppressed.has(pin.id)) {
+            continue;
+        }
+        // 1-based number matching list_pins and the /pin command, so the user and
+        // model refer to a pin by the same identifier (the guid is never exposed).
+        const number = i + 1;
         if (pin.type === "prompt") {
-            sections.push(`<prompt-pin id="${escapeXmlAttr(pin.id)}">\n${escapeXml(pin.text)}\n</prompt-pin>`);
+            sections.push(`<prompt_pin number="${number}">\n${escapeXml(pin.text)}\n</prompt_pin>`);
             continue;
         }
 
@@ -920,7 +923,7 @@ async function renderPinnedContext(sessionId) {
             // Escape so file contents (or pinned text) containing `<`, `&`, or a
             // literal closing tag can't break out of the wrapper boundaries.
             sections.push(
-                `<live-file-pin id="${escapeXmlAttr(pin.id)}" path="${escapeXmlAttr(displayPath)}"${truncatedAttr}>\n${escapeXml(contents)}\n</live-file-pin>`,
+                `<live_file_pin number="${number}" path="${escapeXmlAttr(displayPath)}"${truncatedAttr}>\n${escapeXml(contents)}\n</live_file_pin>`,
             );
         } catch (error) {
             // Report only the error code (e.g. ENOENT/EACCES), never error.message —
@@ -929,27 +932,31 @@ async function renderPinnedContext(sessionId) {
             // attribute already avoids this).
             const reason = fsErrorReason(error);
             sections.push(
-                `<live-file-pin id="${escapeXmlAttr(pin.id)}" path="${escapeXmlAttr(displayPath)}" unreadable="true">\n` +
+                `<live_file_pin number="${number}" path="${escapeXmlAttr(displayPath)}" unreadable="true">\n` +
                     `The pinned file could not be read (${escapeXml(reason)}).\n` +
-                    `</live-file-pin>`,
+                    `</live_file_pin>`,
             );
         }
     }
 
+    if (sections.length === 0) {
+        return undefined;
+    }
+
     return [
-        "<session-pins>",
+        "<session_pins>",
         "The user deliberately pinned the following instructions and live file contents.",
         "Keep them salient and apply them on this turn. A live file is reread from disk for every prompt.",
         "If you hit unexpected behavior, a conflict, or a task that keeps failing or looping, consider" +
             " whether one of these pins is the cause — a stale, over-broad, or contradictory instruction," +
             " or a pinned file that no longer reflects reality. When it is, tell the user which pin (by its" +
-            " id) is interfering. To test a hypothesis, call the test_without_pin tool with that id: it omits" +
-            " the pin from just your next turn (auto-restoring afterward, without changing its saved state)," +
-            " so you can re-run the failing step and compare. Offer to edit or remove a genuinely bad pin" +
-            " (via the /pin command, or the list_pins / unpin tools). Do not silently ignore a pin — surface" +
-            " the conflict instead.",
+            " number) is interfering. To test a hypothesis, call the test_without_pin tool with that number:" +
+            " it omits the pin from just your next turn (auto-restoring afterward, without changing its saved" +
+            " state), so you can re-run the failing step and compare. Offer to edit or remove a genuinely bad" +
+            " pin (via the /pin command, or the list_pins / unpin tools). Do not silently ignore a pin —" +
+            " surface the conflict instead.",
         ...sections,
-        "</session-pins>",
+        "</session_pins>",
     ].join("\n\n");
 }
 
@@ -1275,3 +1282,22 @@ const session = await joinSession({
         },
     },
 });
+
+// On session start, surface how many pins are active (like the CLI's "N plugins
+// loaded" notice) so a resumed session's standing pins aren't invisible. Best-
+// effort: never block or fail extension load.
+try {
+    const startupStore = await loadStore(session.sessionId);
+    if (startupStore.pins.length > 0) {
+        const active = startupStore.pins.filter(isEnabled).length;
+        const disabled = startupStore.pins.length - active;
+        await session.log(
+            `session-pins: ${active} pin${active === 1 ? "" : "s"} active` +
+                (disabled ? ` (${disabled} disabled)` : "") +
+                " in this session — use /pin to view or manage.",
+            { level: "info" },
+        );
+    }
+} catch {
+    // best-effort startup notice; ignore any failure
+}
