@@ -455,6 +455,15 @@ function fileDescriptor(absolutePath, sessionId) {
     return fmtPath(`@${toStoredPath(absolutePath, sessionId)}`);
 }
 
+// Human-readable byte size for the pin-file consent prompt, so the user sees the
+// per-turn context cost of pinning a live file before approving.
+function formatBytes(n) {
+    if (!Number.isFinite(n) || n < 0) return "unknown size";
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function elicitationEnabled() {
     return Boolean(session.capabilities.ui?.elicitation);
 }
@@ -965,7 +974,7 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Pin a file into the current Copilot session so its live contents are re-read from disk and injected into every subsequent prompt. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo). Use after creating or identifying a file the user wants kept in context.",
+            "Pin a file so its FULL contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it — this persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
         parameters: {
             type: "object",
             properties: {
@@ -1005,8 +1014,17 @@ const tools = [
             // (returned to the model) uses the stored/display path to avoid leaking
             // the home dir/username for session-rooted pins.
             const displayTarget = toStoredPath(target, invocation.sessionId);
+            // Surface the file size so the user sees the per-turn context cost before
+            // approving; a pinned file's full contents are re-injected every prompt.
+            let sizeNote = "";
+            try {
+                sizeNote = ` (${formatBytes((await stat(target)).size)}, re-read into context every prompt until unpinned)`;
+            } catch {
+                // Non-fatal: buildPin already validated the file is readable; if the
+                // size can't be read now, just omit the note.
+            }
             const gate = await confirmModelAction(
-                `Allow Copilot to pin this file and re-read it into context every prompt?\n${target}`,
+                `Allow Copilot to pin this file${sizeNote}?\n${target}`,
                 `Refused: pinning a file needs confirmation, which isn't available here. The user can pin it explicitly with /pin add ${fmtPath(`@${displayTarget}`)}`,
             );
             if (!gate.ok) {
@@ -1021,7 +1039,7 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Pin an instruction into the current Copilot session so it is injected into every subsequent prompt. Use to make a directive, decision, or reminder persistent for the rest of the session.",
+            "Pin an instruction so it is injected into every subsequent prompt for the rest of the session (until the user unpins it). Pin ONLY when the user explicitly asks to pin, keep, or remember a directive, decision, or rule; NEVER pin proactively or as a side effect of normal work. For a one-off reminder, just act on it — don't pin.",
         parameters: {
             type: "object",
             properties: {

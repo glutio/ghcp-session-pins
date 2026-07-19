@@ -116,6 +116,7 @@ group("Consent gates (model-initiated pins)");
     writeFileSync(join(state.sessionRoot, "files", "note.md"), "hello");
     out = await tool.pin_file.handler({ path: "note.md" }, inv);
     check("pin_file asks for confirmation", state.confirmCalls.length === 1);
+    check("pin_file confirm prompt discloses the file size + per-turn cost", /\bB\b|KB|MB/.test(state.confirmCalls[0]) && /every prompt/i.test(state.confirmCalls[0]));
     check("pin_file (approved) persists the pin", readPins().some((p) => p.type === "file"));
     check("pin_file (approved) uses unified voice (@path)", /^Pinned pin 1: /.test(out) && out.includes("@note.md"));
 
