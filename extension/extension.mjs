@@ -39,7 +39,7 @@ const storeLoads = new Map();
 const saveQueues = new Map();
 
 // Max characters shown when previewing a prompt pin's text (in the pinboard, the
-// list_pins tool, and log lines). Kept in one place so every preview truncates
+// pin_list tool, and log lines). Kept in one place so every preview truncates
 // at the same, generous length.
 const PREVIEW_LENGTH = 240;
 
@@ -47,7 +47,7 @@ const PREVIEW_LENGTH = 240;
 // with a notice so an accidentally-pinned huge file can't blow up the context.
 const MAX_PINNED_FILE_BYTES = 64 * 1024;
 // Generous, non-blocking advisory threshold: when all active pins together add
-// more than this to every prompt, list_pins / the startup notice mention it. This
+// more than this to every prompt, pin_list / the startup notice mention it. This
 // never blocks pinning — it's purely a heads-up about context cost.
 const SOFT_PIN_BUDGET_BYTES = 200 * 1024;
 
@@ -899,7 +899,7 @@ async function renderPinnedContext(sessionId) {
         if (!isEnabled(pin)) {
             continue;
         }
-        // 1-based number matching list_pins and the /pin command, so the user and
+        // 1-based number matching pin_list and the /pin command, so the user and
         // model refer to a pin by the same identifier (the guid is never exposed).
         const number = i + 1;
         if (pin.type === "prompt") {
@@ -980,7 +980,7 @@ async function confirmModelAction(promptMessage, refuseMessage, declinedMessage 
 }
 
 // Agent-callable tools. These let Copilot manage pins programmatically: add
-// (pin_file / pin_prompt), inspect (list_pins), and remove (unpin / clear_pins).
+// (pin_file / pin_prompt), inspect (pin_list), and remove (pin_remove / pin_clear).
 const tools = [
     {
         name: "pin_file",
@@ -1085,7 +1085,7 @@ const tools = [
         },
     },
     {
-        name: "list_pins",
+        name: "pin_list",
         skipPermission: true,
         defer: "never",
         description:
@@ -1123,17 +1123,17 @@ const tools = [
         },
     },
     {
-        name: "unpin",
+        name: "pin_remove",
         skipPermission: true,
         defer: "never",
         description:
-            "Remove ONE pin from this Copilot session, identified by its 1-based number from list_pins, or a text/path substring to match. Call list_pins first. Use when the user asks to remove or unpin a specific pin.",
+            "Remove ONE pin from this Copilot session, identified by its 1-based number from pin_list, or a text/path substring to match. Call pin_list first. Use when the user asks to remove or unpin a specific pin.",
         parameters: {
             type: "object",
             properties: {
                 number: {
                     type: "integer",
-                    description: "1-based pin number as shown by list_pins.",
+                    description: "1-based pin number as shown by pin_list.",
                 },
                 match: {
                     type: "string",
@@ -1155,8 +1155,8 @@ const tools = [
                 const needle = String(args.match).toLowerCase();
                 index = store.pins.findIndex((p) => {
                     // Only substring-match ENABLED pins. Disabled pins are
-                    // content-redacted in list_pins, so letting `match` search their
-                    // text/path would turn unpin into a probing oracle for hidden
+                    // content-redacted in pin_list, so letting `match` search their
+                    // text/path would turn pin_remove into a probing oracle for hidden
                     // content. Disabled pins can still be removed by number.
                     if (!isEnabled(p)) {
                         return false;
@@ -1168,11 +1168,11 @@ const tools = [
                     return hay.toLowerCase().includes(needle);
                 });
             } else {
-                return "Specify which pin to remove by number or match. Call list_pins first.";
+                return "Specify which pin to remove by number or match. Call pin_list first.";
             }
 
             if (index < 0 || index >= store.pins.length) {
-                return "No matching pin found. Call list_pins to see the current pins.";
+                return "No matching pin found. Call pin_list to see the current pins.";
             }
 
             const victim = store.pins[index];
@@ -1191,7 +1191,7 @@ const tools = [
             const [removed] = store.pins.splice(index, 1);
             await saveStore(invocation.sessionId, store);
             // Don't echo a disabled pin's content back to the model — disabled pins
-            // are content-redacted elsewhere (list_pins), so report by number only.
+            // are content-redacted elsewhere (pin_list), so report by number only.
             if (!isEnabled(removed)) {
                 return `Unpinned pin ${index + 1} (disabled).`;
             }
@@ -1199,7 +1199,7 @@ const tools = [
         },
     },
     {
-        name: "clear_pins",
+        name: "pin_clear",
         skipPermission: true,
         defer: "never",
         description:
