@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# install.sh - copy the session-pins extension into the canonical Copilot CLI
-# extensions directory so the CLI loads it on next startup.
+# install.sh - copy the session-pins extension into the Copilot CLI extensions
+# directory so the CLI loads it on next startup.
 #
 # Usage (from the plugin directory):
 #   ./install.sh
 #
-# Or from anywhere, if the plugin is installed via the Agency Playground marketplace:
-#   "$HOME/.copilot/installed-plugins/agency-playground/session-pins/install.sh"
+# Or from wherever a Copilot plugin marketplace installed the plugin, e.g.:
+#   "<copilot-home>/installed-plugins/<marketplace>/session-pins/install.sh"
+#
+# Honors COPILOT_HOME: installs under "$COPILOT_HOME/extensions" when set,
+# otherwise "$HOME/.copilot/extensions".
 
 set -euo pipefail
 
@@ -18,38 +21,81 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT_SRC="$SCRIPT_DIR/extension"
 
-# Refuse to run if HOME is unset/empty or "/", so the recursive delete below can
-# never target an unintended location (e.g. "/.copilot/extensions/session-pins").
-if [[ -z "${HOME:-}" || "$HOME" == "/" ]]; then
-    echo "Refusing to install: \$HOME is unset or '/'. Set HOME to your home directory and retry." >&2
+# Resolve the Copilot home: prefer COPILOT_HOME (the CLI's configurable home),
+# otherwise ~/.copilot. Refuse if the result is empty or a filesystem root, so the
+# recursive delete below can never target an unintended location.
+COPILOT_ROOT="${COPILOT_HOME:-}"
+if [[ -z "$COPILOT_ROOT" ]]; then
+    if [[ -z "${HOME:-}" ]]; then
+        echo "Refusing to install: neither COPILOT_HOME nor HOME is set." >&2
+        exit 1
+    fi
+    COPILOT_ROOT="$HOME/.copilot"
+fi
+COPILOT_ROOT="${COPILOT_ROOT%/}"
+if [[ -z "$COPILOT_ROOT" || "$COPILOT_ROOT" == "/" || "$COPILOT_ROOT" =~ ^[A-Za-z]:[\\/]?$ ]]; then
+    echo "Refusing to install: resolved Copilot home '$COPILOT_ROOT' is a filesystem root." >&2
     exit 1
 fi
 
-EXT_DST="$HOME/.copilot/extensions/session-pins"
+EXT_DST="$COPILOT_ROOT/extensions/session-pins"
 
 if [[ ! -d "$EXT_SRC" ]]; then
     echo "Source folder not found: $EXT_SRC" >&2
     exit 1
 fi
 
-# Install the extension unless it already exists and --force was not supplied.
-# The destination is cleared before copying so an upgrade can't leave stale files.
-if [[ -d "$EXT_DST" && $FORCE -eq 0 ]]; then
-    echo "session-pins extension already installed at $EXT_DST (re-run with --force to overwrite)."
-else
-    rm -rf -- "$EXT_DST"
-    mkdir -p -- "$EXT_DST"
-    cp -R -- "$EXT_SRC/." "$EXT_DST/"
-    echo "[OK] session-pins extension installed to $EXT_DST"
+# Decide what to do by comparing the plugin's extension against the installed copy:
+#   - not present         -> fresh install
+#   - identical contents  -> up to date, nothing to copy (unless --force)
+#   - contents differ      -> update in place, no --force needed
+# This makes plugin updates apply automatically: the marketplace refreshes the plugin
+# folder, and the next run of this script syncs the changed files into the extensions
+# folder. --force is only an explicit override to recopy identical content.
+STATE="installed"
+if [[ -d "$EXT_DST" ]]; then
+    if [[ $FORCE -eq 0 ]] && diff -r "$EXT_SRC" "$EXT_DST" >/dev/null 2>&1; then
+        STATE="uptodate"
+    else
+        STATE="updated"
+    fi
 fi
 
-cat <<EOF
+if [[ "$STATE" == "uptodate" ]]; then
+    echo "session-pins is already installed and up to date at $EXT_DST."
+else
+    rm -rf "$EXT_DST"
+    mkdir -p "$EXT_DST"
+    cp -R "$EXT_SRC/." "$EXT_DST/"
+    if [[ "$STATE" == "updated" ]]; then
+        echo "[OK] session-pins extension updated to the current version at $EXT_DST"
+    else
+        echo "[OK] session-pins extension installed to $EXT_DST"
+    fi
+fi
 
-Next steps:
-  1. Enable experimental mode so Copilot loads extensions:
-       launch with  copilot --experimental   (or run  /experimental  inside Copilot),
-       then restart your Copilot CLI session so the extension loads at startup.
-  2. Try:   /pin add Remember to run tests before committing.
-  3. Or ask Copilot:  Create a notes.md and pin it.
+echo ""
+if [[ "$STATE" == "uptodate" ]]; then
+    cat <<'EOF'
+Nothing to do — the installed extension already matches this plugin.
+If /pin isn't available, relaunch with  copilot --experimental  (extensions only load in experimental mode).
+EOF
+elif [[ "$STATE" == "updated" ]]; then
+    cat <<'EOF'
+Next step: restart Copilot (relaunch with  copilot --experimental ) so the updated extension loads.
+EOF
+else
+    cat <<'EOF'
+Next step: relaunch with  copilot --experimental  (or run  /experimental  and restart)
+so Copilot loads the extension at startup.
+EOF
+fi
+cat <<'EOF'
+
+Usage once active:
+  /pin                       open the pinboard (browse / add / edit / enable / delete)
+  /pin add <text>            pin an instruction
+  /pin add @<path>           pin a live file
+  Or just ask Copilot:  "Pin the rule that ... "  /  "Pin @notes.md"  /  "What's pinned?"
 
 EOF

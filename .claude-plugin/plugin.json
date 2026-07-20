@@ -7,6 +7,7 @@
     "email": "evpistra@microsoft.com"
   },
   "homepage": "https://github.com/agency-microsoft/playground/tree/main/plugins/session-pins",
+  "commands": "./commands/",
   "keywords": [
     "copilot-cli",
     "pin",
@@ -18,5 +19,5 @@
     "productivity",
     "extension"
   ],
-  "postInstallMessage": "session-pins: one-time activation needed. Copilot CLI does not yet auto-load plugin extensions, so run the bundled install script once, then relaunch with --experimental:\n  Windows: `& \"$HOME\\.copilot\\installed-plugins\\agency-playground\\session-pins\\install.ps1\"`\n  macOS/Linux: `\"$HOME/.copilot/installed-plugins/agency-playground/session-pins/install.sh\"`\nThen use /pin, or just ask Copilot to pin an instruction or file."
+  "postInstallMessage": "session-pins installed. One-time activation is needed, because Copilot CLI does not yet auto-load a plugin's extension. Run this command and approve when asked:\n\n  /session-pins:install\n\nThen relaunch Copilot with  copilot --experimental  (extensions only load in experimental mode). Then use /pin, or just ask Copilot to pin an instruction or file. Running /session-pins:install again later is safe — it just reports status and usage."
 }

@@ -1,15 +1,13 @@
 # Session Pins
 
-**Keep a small, editable brief — rules, decisions, and key files — salient for one Copilot CLI session, without touching your repo or creating cross-session memory.**
+**Pin instructions and live files so they're injected into every prompt of your Copilot CLI session.**
 
-In a long session, the things that must stay true — a constraint, a decision you made, the file
-that's the source of truth — get buried as the conversation grows or is compacted. Session Pins
-*sticks* them so they ride along on every turn until you remove them. Unlike repository instruction
-files or `/memory`, pins are **session-scoped and ephemeral**: they travel with the session and
-vanish when it's deleted, so they never pollute your repo or persist across sessions.
+Copilot has no memory within a session beyond the rolling context. Session Pins lets you
+*stick* the things that must stay salient — a rule, a decision, or a file — so they ride along
+on every turn until you remove them.
 
 - **Prompt pin** — an editable instruction added to every prompt (e.g. *"don't reinvent X, follow Y.md"*).
-- **Live file pin** — a file re-read from disk on every prompt, so edits to it stay reflected automatically (up to the first 64 KB is injected; larger files are truncated). Best for small, evolving docs — a plan, decisions, acceptance criteria — not large source files.
+- **Live file pin** — a file re-read from disk on every prompt, so edits to it stay reflected automatically.
 
 Pins are stored in the **session folder** as `pins.json` — the session's workspace directory
 (`session.workspacePath`) when available, otherwise `~/.copilot/session-state/<id>/`. Either way
@@ -28,19 +26,29 @@ agency copilot
 **One-time activation.** Installing registers the plugin, but Copilot CLI doesn't yet
 auto-load a plugin's *extension* (the part that provides the `/pin` command and the pin
 tools) — that's still behind a feature flag. And for safety the CLI never runs a plugin's
-scripts for you, so you run a small script once yourself. It just copies the extension into
-`~/.copilot/extensions/`, where Copilot loads it on startup:
+scripts for you. So the plugin ships a one-time activation command — run it and approve when
+Copilot asks:
+
+```text
+/session-pins:install
+```
+
+It copies the extension into `~/.copilot/extensions/` (where Copilot loads it on startup). Then
+relaunch Copilot with **`--experimental`** (extensions only load in experimental mode; you can
+also toggle it in-session with `/experimental`). Running `/session-pins:install` again later is
+safe and is also how you **update**: if you upgrade the plugin, re-run it and it refreshes the
+installed extension automatically (no flags needed); if nothing changed it just says it's already
+up to date.
+
+Prefer to do it by hand? Run the bundled installer directly instead — it's at the root of the
+installed plugin folder (`…/installed-plugins/<marketplace>/session-pins/`):
 
 ```powershell
-& "$HOME\.copilot\installed-plugins\agency-playground\session-pins\install.ps1"
+& "$HOME\.copilot\installed-plugins\<marketplace>\session-pins\install.ps1"
 ```
 ```bash
-"$HOME/.copilot/installed-plugins/agency-playground/session-pins/install.sh"
+"$HOME/.copilot/installed-plugins/<marketplace>/session-pins/install.sh"
 ```
-
-Then relaunch Copilot with **`--experimental`** (extensions only load in experimental mode;
-you can also toggle it in-session with `/experimental`). You'll see a reminder with this same
-command right after install.
 
 ### Local / from source
 
@@ -80,13 +88,13 @@ For direct, interactive control there's a single `/pin` command:
 /pin clear            Remove all
 ```
 
-In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **open** it in an editor (file pins — Copilot opens it for you), **enable/disable** it (a quick way to silence a pin without deleting it), edit it in place, or delete it; `Esc` exits.
+In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **enable/disable** it (a quick way to silence a pin without deleting it), edit it in place, or delete it; `Esc` exits.
 
-### Enabling and disabling pins
+### Enabling, disabling, and diagnosing pins
 
 A disabled pin is kept in the list but not injected into prompts — handy for temporarily silencing a rule without losing it. Only you change this state, from the pinboard.
 
-Disabling doubles as the diagnostic: if a pinned rule or file seems to be causing trouble, disable it, re-run the step, and re-enable it if it wasn't the cause. Copilot will also point out (by its number) any pin that looks stale or in conflict, but only you change a pin's state or remove it.
+When Copilot is diagnosing a problem, it can also *test* whether a pin is the culprit: the `test_without_pin` tool omits a single pin from **just the next turn** and then restores it automatically. This is in-memory only and never written to disk, so the agent can experiment safely — it can't leave a pin "stuck off", and it can never permanently disable a pin (that's yours to control).
 
 ## Alternative: force-load an instructions file from the session folder
 
