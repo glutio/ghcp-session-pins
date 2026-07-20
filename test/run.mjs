@@ -532,6 +532,16 @@ group("Pin dialog order + pin_file path normalization");
     const bare = await tool.pin_file.handler({ path: "@" }, inv);
     check("pin_file rejects a bare @", /no file path/i.test(bare) && readPins().length === 0);
 
+    // A relative path with '..' must be rejected (it would escape <session>/files
+    // and be stored as an absolute pin, bypassing the load-time traversal guard).
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "secret.txt"), "TOPSECRET");   // sits OUTSIDE files/
+    const trav = await tool.pin_file.handler({ path: "@../secret.txt" }, inv);
+    check("pin_file rejects a relative traversal path", /can't contain '\.\.'/i.test(trav));
+    check("pin_file traversal attempt pins nothing", readPins().length === 0);
+    check("pin_file traversal did not even ask to confirm", state.confirmCalls.length === 0);
+
     // A missing session-rooted file must report only an fs error code and the
     // relative display path — never the absolute session/home path (which fs
     // error messages embed) and never the raw error message.

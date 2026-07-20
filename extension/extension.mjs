@@ -171,6 +171,15 @@ function resolveInputPath(rawPath, sessionId) {
     return isAbsolute(rawPath) ? rawPath : resolve(sessionFilesDir(sessionId), rawPath);
 }
 
+// A relative input path is contractually rooted at <session>/files, so a ".."
+// segment would let it escape that folder and be stored as an absolute pin —
+// bypassing the load-time traversal guard (which only rejects "..") in stored
+// relative paths). Reject relative traversal at input time; pinning an
+// outside-session file requires an explicit absolute path.
+function hasRelativeTraversal(rawPath) {
+    return !isAbsolute(rawPath) && rawPath.split(/[\\/]/).includes("..");
+}
+
 async function loadStore(sessionId) {
     const path = pinsFile(sessionId);
     if (stores.has(path)) {
@@ -344,6 +353,12 @@ async function buildPin(raw, sessionId) {
         const rawPath = cleanPathArgument(trimmed);
         if (!rawPath) {
             return { ok: false, error: "No file path was provided." };
+        }
+        if (hasRelativeTraversal(rawPath)) {
+            return {
+                ok: false,
+                error: "A relative pin path can't contain '..' (it's rooted at the session files folder). Pass an absolute path to pin a file outside the session.",
+            };
         }
 
         // Session-rooted: a relative path resolves against the session files
@@ -574,6 +589,13 @@ async function editPin(ctx, store, index) {
 
     const cleaned = cleanPathArgument(editedPath);
     if (!cleaned) {
+        return;
+    }
+    if (hasRelativeTraversal(cleaned)) {
+        await session.log(
+            "A relative pin path can't contain '..' (it's rooted at the session files folder). Pass an absolute path to pin a file outside the session.",
+            { level: "error" },
+        );
         return;
     }
 
