@@ -960,11 +960,8 @@ async function renderPinnedContext(sessionId) {
 
     return [
         "<session_pins>",
-        "The user deliberately pinned the following for this session — keep it salient and apply it on" +
-            " this turn. A live file is reread from disk every prompt.",
-        "If a pin looks stale, over-broad, or in conflict with the task, don't silently ignore it: say" +
-            " which pin (by its number) looks wrong so the user can edit, disable, or remove it via /pin" +
-            " (or the unpin tool).",
+        "The user pinned the following for this session — treat it as active instructions and apply it" +
+            " this turn. A live file is re-read from disk each prompt, so its contents are current.",
         ...sections,
         "</session_pins>",
     ].join("\n\n");
