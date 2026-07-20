@@ -225,7 +225,6 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     // The every-turn preamble must tell the agent to consider pins as a possible
     // cause when debugging, and to surface (not silently ignore) a conflicting pin.
     check("preamble frames pins as active instructions", /treat it as active instructions/i.test(out));
-    check("preamble notes live files are current", /re-read from disk/i.test(out) && /current/i.test(out));
 }
 
 // ---------------------------------------------------------------------------

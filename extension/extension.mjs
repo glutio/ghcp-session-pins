@@ -960,8 +960,7 @@ async function renderPinnedContext(sessionId) {
 
     return [
         "<session_pins>",
-        "The user pinned the following for this session — treat it as active instructions and apply it" +
-            " this turn. A live file is re-read from disk each prompt, so its contents are current.",
+        "The user pinned the following for this session — treat it as active instructions and apply it this turn.",
         ...sections,
         "</session_pins>",
     ].join("\n\n");
