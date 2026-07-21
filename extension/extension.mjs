@@ -20,7 +20,7 @@ import { joinSession } from "@github/copilot-sdk/extension";
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 const stores = new Map();
 // Assigned once joinSession() resolves (declared here so helpers like sessionDir
@@ -202,11 +202,6 @@ function insideRelative(baseDir, absolutePath) {
         }
     }
     return null;
-}
-
-// True when an absolute path is inside a base directory.
-function isInsideDir(baseDir, absolutePath) {
-    return insideRelative(baseDir, absolutePath) !== null;
 }
 
 // How a resolved absolute path is stored: relative to the session files folder
