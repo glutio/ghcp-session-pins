@@ -553,6 +553,18 @@ group("Pin dialog order + pin_file path normalization");
     check("pin_file stores a case-variant in-session path as a file pin", !!casedPin);
     check("pin_file does not store an in-session file as an absolute pin", casedPin && !casedPin.path.includes(":") && !casedPin.path.startsWith("/"));
 
+    // A file whose NAME begins with dots (e.g. "..notes.md") is still inside the
+    // session files dir — a leading ".." must only count as "outside" when it is a
+    // whole path segment, not a filename prefix. Given via its absolute path, it
+    // must be stored as a RELATIVE pin (never absolute), or the session path leaks.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "..notes.md"), "hi");
+    await tool.pin_file.handler({ path: join(state.sessionRoot, "files", "..notes.md") }, inv);
+    const dotPin = readPins().find((p) => p.type === "file");
+    check("pin_file pins a dotted-name in-session file", !!dotPin);
+    check("pin_file stores a dotted-name file relatively, not absolutely", dotPin && dotPin.path === "..notes.md");
+
     // Bare '@' (no filename) is still rejected cleanly.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;

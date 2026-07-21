@@ -42,6 +42,13 @@ if ($copilotRoot -match '^[A-Za-z]:$' -or $copilotRoot -in @('', '\', '/')) {
     Write-Error "Refusing to install: resolved Copilot home '$copilotRoot' is a filesystem root."
     exit 1
 }
+# Refuse a Copilot home containing a ".." segment. A value like "C:\.." or "/a/../.."
+# can normalize to a filesystem root (or an unexpected location), and the recursive
+# delete below must never target such a path.
+if (($copilotRoot -split '[\\/]') -contains '..') {
+    Write-Error "Refusing to install: Copilot home '$copilotRoot' contains a '..' path segment. Set COPILOT_HOME to a normalized absolute path."
+    exit 1
+}
 # Refuse a non-rooted (relative) Copilot home. Otherwise $extDst would be relative
 # and the Remove-Item -Recurse below could delete a directory under the current
 # working directory instead of the intended location.

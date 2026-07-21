@@ -12,7 +12,7 @@ plugin was upgraded, or reports that it's already up to date. Do this now:
 
 1. Locate the bundled installer and run the one for the current OS.
 
-   Find it by globbing **`**/session-pins/install.*`** under the Copilot home — `$COPILOT_HOME`,
+   Find it by globbing `**/session-pins/install.*` under the Copilot home — `$COPILOT_HOME`,
    or `~/.copilot` when `COPILOT_HOME` is unset. That resolves to
    `installed-plugins/<marketplace>/session-pins/`, which ships **both** scripts. Run the one that
    matches the current platform:

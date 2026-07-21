@@ -50,6 +50,15 @@ if [[ -z "$COPILOT_ROOT" || "$COPILOT_ROOT" == "/" || "$COPILOT_ROOT" =~ ^[A-Za-
     echo "Refusing to install: resolved Copilot home '$COPILOT_ROOT' is a filesystem root." >&2
     exit 1
 fi
+# Refuse a Copilot home containing a ".." segment. A value like "/a/../.." or
+# "C:\.." can normalize to a filesystem root (or an unexpected location), and the
+# rm -rf below must never target such a path.
+case "/${COPILOT_ROOT//\\//}/" in
+    */../*)
+        echo "Refusing to install: Copilot home '$COPILOT_ROOT' contains a '..' path segment. Set COPILOT_HOME to a normalized absolute path." >&2
+        exit 1
+        ;;
+esac
 # Refuse a non-absolute Copilot home. Otherwise EXT_DST would be relative and the
 # rm -rf below could delete a directory under the current working directory. Accept
 # POSIX absolute paths (/...) and Windows-style absolute paths (C:\... or C:/...).

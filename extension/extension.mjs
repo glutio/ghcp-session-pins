@@ -20,7 +20,7 @@ import { joinSession } from "@github/copilot-sdk/extension";
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const stores = new Map();
 // Assigned once joinSession() resolves (declared here so helpers like sessionDir
@@ -157,13 +157,26 @@ function sessionFilesDir(sessionId) {
 // case-insensitively on those platforms.
 const CASE_INSENSITIVE_FS = process.platform === "win32" || process.platform === "darwin";
 
+// True when a path produced by relative(base, target) keeps target inside base.
+// Only a leading ".." *segment* means "outside" — a filename that merely starts
+// with dots (e.g. "..notes.md") is still inside.
+function relativeStaysInside(rel) {
+    if (rel === "") {
+        return true;
+    }
+    if (isAbsolute(rel)) {
+        return false;
+    }
+    return rel.split(/[\\/]/)[0] !== "..";
+}
+
 // Relative path of absolutePath within baseDir when it is inside, otherwise null.
 function insideRelative(baseDir, absolutePath) {
     if (!baseDir) {
         return null;
     }
     const rel = relative(baseDir, absolutePath);
-    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+    if (relativeStaysInside(rel)) {
         return rel;
     }
     if (CASE_INSENSITIVE_FS) {
@@ -171,7 +184,7 @@ function insideRelative(baseDir, absolutePath) {
         // is what covers macOS. The folded relative is safe to read/store on a
         // case-insensitive filesystem.
         const relCI = relative(baseDir.toLowerCase(), absolutePath.toLowerCase());
-        if (relCI === "" || (!relCI.startsWith("..") && !isAbsolute(relCI))) {
+        if (relativeStaysInside(relCI)) {
             return relCI;
         }
     }
@@ -460,10 +473,14 @@ async function addPinToStore(sessionId, pin) {
         }
     }
     store.pins.push(pin);
+    // Capture this pin's number before awaiting: pins are only ever appended, so
+    // the index is stable, but store.pins.length could change if a concurrent add
+    // on the shared store runs during the save await.
+    const pinNumber = store.pins.length;
     await saveStore(sessionId, store);
     return {
         added: true,
-        message: `Pinned pin ${store.pins.length}: ${pinDescriptor(pin, sessionId)}.`,
+        message: `Pinned pin ${pinNumber}: ${pinDescriptor(pin, sessionId)}.`,
     };
 }
 
