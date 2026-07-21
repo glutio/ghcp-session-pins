@@ -101,9 +101,9 @@ function isValidPin(pin) {
         // A relative file-pin path is resolved under the session files folder, so a
         // hand-edited pins.json entry like "../.ssh/id_rsa" would traverse outside
         // it and read arbitrary files into prompt context. Reject relative paths
-        // that contain a ".." segment. (Absolute pins are an intentional feature for
-        // files outside the session and are left as-is.)
-        if (!isAbsolute(pin.path) && pin.path.split(/[\\/]/).includes("..")) {
+        // that contain a ".." segment (same rule as input-time hasRelativeTraversal).
+        // (Absolute pins are an intentional feature for files outside the session.)
+        if (hasRelativeTraversal(pin.path)) {
             return false;
         }
         return true;
