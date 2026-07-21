@@ -314,6 +314,19 @@ async function saveStore(sessionId, store) {
             try { await rm(temporaryPath, { force: true }); } catch {}
             throw error;
         }
+        // Best-effort: on POSIX, fsync the parent directory so the rename itself
+        // (the directory-entry update) is durable, not just the file contents —
+        // otherwise a crash right after rename could still lose the update. Opening
+        // a directory for sync isn't supported on Windows (rename durability there
+        // is handled by MoveFileEx), so any error is swallowed.
+        try {
+            const directoryHandle = await open(dirname(path), "r");
+            try {
+                await directoryHandle.sync();
+            } finally {
+                await directoryHandle.close();
+            }
+        } catch {}
         stores.set(path, store);
     };
     // Chain onto any in-flight save for this path so writes (and their renames)
