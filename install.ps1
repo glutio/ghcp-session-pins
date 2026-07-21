@@ -23,7 +23,14 @@ $extSrc = Join-Path $PSScriptRoot "extension"
 # otherwise ~/.copilot. Refuse if the result is empty or a filesystem/drive root
 # so the recursive delete below can never target an unintended location.
 if (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
-    $copilotRoot = $env:COPILOT_HOME
+    $copilotRoot = $env:COPILOT_HOME.Trim()
+    # Expand a leading ~ (e.g. ~\.copilot). PowerShell does not expand ~ stored in
+    # an env var, so resolve it against the user's home to avoid writing (and later
+    # deleting) under a literal ".\~\.copilot" relative to the current directory.
+    if ($copilotRoot -eq '~' -or $copilotRoot -match '^~[\\/]') {
+        $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+        $copilotRoot = if ($copilotRoot -eq '~') { $homeDir } else { Join-Path $homeDir $copilotRoot.Substring(2) }
+    }
 } elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     $copilotRoot = Join-Path $env:USERPROFILE ".copilot"
 } else {

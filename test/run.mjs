@@ -10,7 +10,7 @@
 //
 // Run:  npm test   (from the plugin folder)
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
 const state = {
@@ -596,6 +596,31 @@ group("COPILOT_HOME fallback (no workspacePath)");
     state.noWorkspace = false;
     if (savedEnv === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = savedEnv;
     try { rmSync(home, { recursive: true, force: true }); } catch {}
+}
+
+group("COPILOT_HOME with a leading ~ is expanded");
+{
+    // A COPILOT_HOME like "~/<name>" must resolve under the real home directory,
+    // not a literal "./~/..." relative dir. Use a unique subfolder of home so the
+    // test is isolated and cleanable.
+    const unique = `sp-tilde-test-${process.pid}-${Date.now()}`;
+    const expandedRoot = join(homedir(), unique);
+    const savedEnv = process.env.COPILOT_HOME;
+    process.env.COPILOT_HOME = `~/${unique}`;
+    freshSession();
+    state.noWorkspace = true;          // force the COPILOT_HOME fallback path
+    state.elicitation = true; state.confirmReturn = true;
+    let threw = false;
+    try { await tool.pin_prompt.handler({ text: "tilde home" }, inv); } catch { threw = true; }
+    check("pin write under ~-form COPILOT_HOME did not throw", !threw);
+    const litter = join(process.cwd(), "~");
+    check("no literal ~ directory created in cwd", !existsSync(litter));
+    check("pins.json is written under the expanded home path", existsSync(expandedRoot));
+
+    // restore
+    state.noWorkspace = false;
+    if (savedEnv === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = savedEnv;
+    try { rmSync(expandedRoot, { recursive: true, force: true }); } catch {}
 }
 
 // ---------------------------------------------------------------------------

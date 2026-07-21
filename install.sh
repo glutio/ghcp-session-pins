@@ -31,6 +31,14 @@ if [[ -z "$COPILOT_ROOT" ]]; then
         exit 1
     fi
     COPILOT_ROOT="$HOME/.copilot"
+else
+    # Expand a leading ~ (e.g. COPILOT_HOME=~/.copilot). Bash does not expand ~ that
+    # comes from a variable, so without this the script would install under a literal
+    # "./~/.copilot/..." relative to the current directory (and rm -rf would run there).
+    case "$COPILOT_ROOT" in
+        "~") COPILOT_ROOT="${HOME:-$COPILOT_ROOT}" ;;
+        "~/"*) COPILOT_ROOT="${HOME:-}/${COPILOT_ROOT#\~/}" ;;
+    esac
 fi
 COPILOT_ROOT="${COPILOT_ROOT%/}"
 if [[ -z "$COPILOT_ROOT" || "$COPILOT_ROOT" == "/" || "$COPILOT_ROOT" =~ ^[A-Za-z]:[\\/]?$ ]]; then

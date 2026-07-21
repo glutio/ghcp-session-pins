@@ -122,9 +122,21 @@ function pinsFile(sessionId) {
 // path; otherwise honor COPILOT_HOME (Copilot CLI's configurable home) before
 // falling back to the default ~/.copilot, so pins land in the right place when the
 // home is relocated.
+// Expand a leading ~ (~, ~/, ~\) to the user's home directory, since neither
+// path.resolve nor the shell expands ~ when it arrives from an env var or picker.
+function expandTilde(value) {
+    if (value === "~") {
+        return homedir();
+    }
+    if (value.startsWith("~/") || value.startsWith("~\\")) {
+        return join(homedir(), value.slice(2));
+    }
+    return value;
+}
+
 function copilotHome() {
     const configured = process.env.COPILOT_HOME?.trim();
-    return configured ? configured : join(homedir(), ".copilot");
+    return configured ? expandTilde(configured) : join(homedir(), ".copilot");
 }
 
 function sessionDir(sessionId) {
@@ -331,11 +343,7 @@ function cleanPathArgument(raw) {
 
     // Expand a leading ~ (e.g. from the @ file picker) to the home directory,
     // since path.resolve does not treat ~ specially.
-    if (value === "~") {
-        value = homedir();
-    } else if (value.startsWith("~/") || value.startsWith("~\\")) {
-        value = join(homedir(), value.slice(2));
-    }
+    value = expandTilde(value);
 
     return value;
 }
