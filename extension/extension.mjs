@@ -18,7 +18,7 @@
 
 import { joinSession } from "@github/copilot-sdk/extension";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -268,7 +268,14 @@ async function saveStore(sessionId, store) {
                 await handle.close();
             }
         }
-        await rename(temporaryPath, path);
+        try {
+            await rename(temporaryPath, path);
+        } catch (error) {
+            // Best-effort: if the rename fails (e.g. a transient AV/permissions lock
+            // on Windows), don't leave the temp file littering the session folder.
+            try { await rm(temporaryPath, { force: true }); } catch {}
+            throw error;
+        }
         stores.set(path, store);
     };
     // Chain onto any in-flight save for this path so writes (and their renames)

@@ -25,6 +25,11 @@ EXT_SRC="$SCRIPT_DIR/extension"
 # otherwise ~/.copilot. Refuse if the result is empty or a filesystem root, so the
 # recursive delete below can never target an unintended location.
 COPILOT_ROOT="${COPILOT_HOME:-}"
+# Trim leading/trailing whitespace (the PowerShell installer trims too) so a value
+# like " ~/.copilot " can't resolve to an unintended path before the ~ expansion
+# and root-safety checks below.
+COPILOT_ROOT="${COPILOT_ROOT#"${COPILOT_ROOT%%[![:space:]]*}"}"
+COPILOT_ROOT="${COPILOT_ROOT%"${COPILOT_ROOT##*[![:space:]]}"}"
 if [[ -z "$COPILOT_ROOT" ]]; then
     if [[ -z "${HOME:-}" ]]; then
         echo "Refusing to install: neither COPILOT_HOME nor HOME is set." >&2
