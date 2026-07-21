@@ -14,8 +14,23 @@
 set -euo pipefail
 
 FORCE=0
-if [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]]; then
-    FORCE=1
+# Fail fast on unknown arguments. This installer does a recursive delete of the
+# destination, so a copy/paste with stray flags/words should not silently proceed.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force|-f) FORCE=1; shift ;;
+        --) shift; break ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            echo "Usage: install.sh [--force]" >&2
+            exit 1
+            ;;
+    esac
+done
+if [[ $# -gt 0 ]]; then
+    echo "Unexpected argument(s): $*" >&2
+    echo "Usage: install.sh [--force]" >&2
+    exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

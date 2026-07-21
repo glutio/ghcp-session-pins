@@ -12,10 +12,20 @@
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'User-facing installer output; the machine-readable signal is the exit code, not stdout.')]
 param(
-    [switch]$Force
+    [switch]$Force,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Rest
 )
 
 $ErrorActionPreference = "Stop"
+
+# Fail fast on unexpected arguments. This installer removes and replaces the
+# destination folder, so a copy/paste with stray flags/words should not silently
+# proceed.
+if ($Rest -and $Rest.Count -gt 0) {
+    Write-Error "Unexpected argument(s): $($Rest -join ' '). Usage: install.ps1 [-Force]"
+    exit 1
+}
 
 $extSrc = Join-Path $PSScriptRoot "extension"
 
