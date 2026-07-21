@@ -683,12 +683,12 @@ async function editPin(ctx, store, index) {
     }
 
     const absolutePath = resolveInputPath(cleaned, ctx.sessionId);
-    if (absolutePath === resolveFilePin(pin, ctx.sessionId)) {
+    if (samePath(absolutePath, resolveFilePin(pin, ctx.sessionId))) {
         return;
     }
 
     const duplicate = store.pins.some(
-        (p) => p !== pin && p.type === "file" && resolveFilePin(p, ctx.sessionId) === absolutePath,
+        (p) => p !== pin && p.type === "file" && samePath(resolveFilePin(p, ctx.sessionId), absolutePath),
     );
     if (duplicate) {
         await session.log(`Already pinned: ${fileDescriptor(absolutePath, ctx.sessionId)}.`, { level: "info" });
