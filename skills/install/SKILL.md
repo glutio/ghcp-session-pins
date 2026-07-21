@@ -21,8 +21,8 @@ plugin was upgraded, or reports that it's already up to date. Do this now:
 
    Forward-slash globs work on every OS (including Windows). If more than one plugin folder matches
    (installed from multiple marketplaces), any of them works — they are identical. The installer
-   also sits at the root of this plugin (the parent of the `commands/` folder holding this file),
-   so a plugin-relative path works too if you can resolve it.
+   also sits at the root of this plugin (the grandparent of this file, which lives at
+   `skills/install/SKILL.md`), so a plugin-relative path works too if you can resolve it.
 
    Run the installer **with no extra flags** — do **not** pass `-Force` (PowerShell) or `--force`
    (bash). The installer already detects and applies updates on its own; the force flag only
