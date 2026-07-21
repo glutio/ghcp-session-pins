@@ -28,7 +28,13 @@ if (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
     # an env var, so resolve it against the user's home to avoid writing (and later
     # deleting) under a literal ".\~\.copilot" relative to the current directory.
     if ($copilotRoot -eq '~' -or $copilotRoot -match '^~[\\/]') {
-        $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+        $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { $null }
+        # Refuse if ~ is used but no home directory is available — otherwise the path
+        # would collapse to a relative/unexpected location before the delete.
+        if ([string]::IsNullOrWhiteSpace($homeDir)) {
+            Write-Error "Refusing to install: COPILOT_HOME uses '~' but no home directory (USERPROFILE/HOME) is set."
+            exit 1
+        }
         $copilotRoot = if ($copilotRoot -eq '~') { $homeDir } else { Join-Path $homeDir $copilotRoot.Substring(2) }
     }
 } elseif (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {

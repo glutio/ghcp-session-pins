@@ -39,10 +39,21 @@ if [[ -z "$COPILOT_ROOT" ]]; then
 else
     # Expand a leading ~ (e.g. COPILOT_HOME=~/.copilot). Bash does not expand ~ that
     # comes from a variable, so without this the script would install under a literal
-    # "./~/.copilot/..." relative to the current directory (and rm -rf would run there).
+    # "./~/.copilot/..." relative to the current directory (and the recursive delete
+    # would run there). Refuse if ~ is used but HOME is unset — otherwise "~/x" would
+    # collapse to "/x" and operate under an unexpected location.
     case "$COPILOT_ROOT" in
-        "~") COPILOT_ROOT="${HOME:-$COPILOT_ROOT}" ;;
-        "~/"*) COPILOT_ROOT="${HOME:-}/${COPILOT_ROOT#\~/}" ;;
+        "~"|"~/"*)
+            if [[ -z "${HOME:-}" ]]; then
+                echo "Refusing to install: COPILOT_HOME uses '~' but HOME is not set." >&2
+                exit 1
+            fi
+            if [[ "$COPILOT_ROOT" == "~" ]]; then
+                COPILOT_ROOT="$HOME"
+            else
+                COPILOT_ROOT="$HOME/${COPILOT_ROOT#\~/}"
+            fi
+            ;;
     esac
 fi
 COPILOT_ROOT="${COPILOT_ROOT%/}"
