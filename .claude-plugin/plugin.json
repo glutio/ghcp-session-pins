@@ -7,7 +7,7 @@
     "email": "evpistra@microsoft.com"
   },
   "homepage": "https://github.com/agency-microsoft/playground/tree/main/plugins/session-pins",
-  "commands": "./commands/",
+  "skills": "./skills/",
   "keywords": [
     "copilot-cli",
     "pin",
