@@ -374,6 +374,21 @@ group("Enable / disable pins");
 }
 
 // ---------------------------------------------------------------------------
+group("Tool schema compatibility (defer / skipPermission fields)");
+{
+    const pinTools = tools.filter((t) => t.name.startsWith("pin_"));
+    check("all five pin_* tools are registered", pinTools.length === 5);
+    // `defer` is a documented SDK tool field ("auto" | "never"); we set "never" so
+    // the pin tools stay visible to the model instead of hiding behind tool search.
+    check("pin tools declare defer: 'never'", pinTools.every((t) => t.defer === "never"));
+    check("no pin tool uses an unsupported defer value",
+        pinTools.every((t) => t.defer === undefined || t.defer === "auto" || t.defer === "never"));
+    // These are model-initiated helpers guarded by their own consent gates, so they
+    // declare skipPermission to avoid a redundant outer permission prompt.
+    check("pin tools declare skipPermission: true", pinTools.every((t) => t.skipPermission === true));
+}
+
+// ---------------------------------------------------------------------------
 group("Diagnostics are user-driven (no test_without_pin / suppress tool)");
 {
     check("test_without_pin tool was removed", !tools.some((t) => t.name === "test_without_pin"));
