@@ -50,6 +50,13 @@ if [[ -z "$COPILOT_ROOT" || "$COPILOT_ROOT" == "/" || "$COPILOT_ROOT" =~ ^[A-Za-
     echo "Refusing to install: resolved Copilot home '$COPILOT_ROOT' is a filesystem root." >&2
     exit 1
 fi
+# Refuse a non-absolute Copilot home. Otherwise EXT_DST would be relative and the
+# rm -rf below could delete a directory under the current working directory. Accept
+# POSIX absolute paths (/...) and Windows-style absolute paths (C:\... or C:/...).
+if [[ "$COPILOT_ROOT" != /* && ! "$COPILOT_ROOT" =~ ^[A-Za-z]:[\\/] ]]; then
+    echo "Refusing to install: Copilot home '$COPILOT_ROOT' is not an absolute path. Set COPILOT_HOME to a full path." >&2
+    exit 1
+fi
 
 EXT_DST="$COPILOT_ROOT/extensions/session-pins"
 

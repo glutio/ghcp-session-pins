@@ -42,6 +42,13 @@ if ($copilotRoot -match '^[A-Za-z]:$' -or $copilotRoot -in @('', '\', '/')) {
     Write-Error "Refusing to install: resolved Copilot home '$copilotRoot' is a filesystem root."
     exit 1
 }
+# Refuse a non-rooted (relative) Copilot home. Otherwise $extDst would be relative
+# and the Remove-Item -Recurse below could delete a directory under the current
+# working directory instead of the intended location.
+if (-not [IO.Path]::IsPathRooted($copilotRoot)) {
+    Write-Error "Refusing to install: Copilot home '$copilotRoot' is not an absolute path. Set COPILOT_HOME to a full path."
+    exit 1
+}
 
 $extDst = Join-Path $copilotRoot "extensions\session-pins"
 
