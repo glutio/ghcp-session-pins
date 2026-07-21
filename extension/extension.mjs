@@ -170,6 +170,19 @@ function relativeStaysInside(rel) {
     return rel.split(/[\\/]/)[0] !== "..";
 }
 
+// True when two absolute paths point at the same file. Uses resolve() to collapse
+// redundant segments/separators, and folds case on case-insensitive filesystems
+// (Windows/macOS) so "Notes.md" and "notes.md" aren't treated as distinct pins.
+function samePath(a, b) {
+    let pa = resolve(a);
+    let pb = resolve(b);
+    if (CASE_INSENSITIVE_FS) {
+        pa = pa.toLowerCase();
+        pb = pb.toLowerCase();
+    }
+    return pa === pb;
+}
+
 // Relative path of absolutePath within baseDir when it is inside, otherwise null.
 function insideRelative(baseDir, absolutePath) {
     if (!baseDir) {
@@ -476,7 +489,7 @@ async function addPinToStore(sessionId, pin) {
     if (pin.type === "file") {
         const target = resolveFilePin(pin, sessionId);
         const dupIndex = store.pins.findIndex(
-            (p) => p.type === "file" && resolveFilePin(p, sessionId) === target,
+            (p) => p.type === "file" && samePath(resolveFilePin(p, sessionId), target),
         );
         if (dupIndex >= 0) {
             return {

@@ -580,6 +580,19 @@ group("Pin dialog order + pin_file path normalization");
     check("pin_file pins a dotted-name in-session file", !!dotPin);
     check("pin_file stores a dotted-name file relatively, not absolutely", dotPin && dotPin.path === "..notes.md");
 
+    // De-duping: pinning the same in-session file twice must not create a second
+    // pin. On case-insensitive filesystems a case-variant path is the same file, so
+    // it must also dedupe (via samePath's resolve + case-fold).
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "Dup.md"), "hi");
+    await tool.pin_file.handler({ path: "Dup.md" }, inv);
+    const afterFirst = readPins().length;
+    const variant = process.platform === "win32" || process.platform === "darwin" ? "dup.md" : "Dup.md";
+    const dupOut = await tool.pin_file.handler({ path: variant }, inv);
+    check("pinning the same file again does not add a second pin", readPins().length === afterFirst);
+    check("duplicate pin_file reports it is already pinned", /already pinned/i.test(dupOut));
+
     // Bare '@' (no filename) is still rejected cleanly.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
