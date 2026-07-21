@@ -149,21 +149,46 @@ function sessionFilesDir(sessionId) {
     return join(sessionDir(sessionId), SESSION_FILES_SUBDIR);
 }
 
-// True when an absolute path is inside a base directory.
-function isInsideDir(baseDir, absolutePath) {
+// Windows and macOS default to case-insensitive filesystems, but path.relative()
+// compares case-sensitively on posix (macOS). So a file genuinely under
+// <session>/files whose absolute path differs only by casing could be
+// misclassified as "outside" and stored/displayed as an absolute path — leaking
+// the session/home path into every injected prompt. Retry the containment check
+// case-insensitively on those platforms.
+const CASE_INSENSITIVE_FS = process.platform === "win32" || process.platform === "darwin";
+
+// Relative path of absolutePath within baseDir when it is inside, otherwise null.
+function insideRelative(baseDir, absolutePath) {
     if (!baseDir) {
-        return false;
+        return null;
     }
     const rel = relative(baseDir, absolutePath);
-    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+    if (rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))) {
+        return rel;
+    }
+    if (CASE_INSENSITIVE_FS) {
+        // On win32 the first relative() is already case-insensitive; this retry
+        // is what covers macOS. The folded relative is safe to read/store on a
+        // case-insensitive filesystem.
+        const relCI = relative(baseDir.toLowerCase(), absolutePath.toLowerCase());
+        if (relCI === "" || (!relCI.startsWith("..") && !isAbsolute(relCI))) {
+            return relCI;
+        }
+    }
+    return null;
+}
+
+// True when an absolute path is inside a base directory.
+function isInsideDir(baseDir, absolutePath) {
+    return insideRelative(baseDir, absolutePath) !== null;
 }
 
 // How a resolved absolute path is stored: relative to the session files folder
 // when it lives inside it (session-rooted), otherwise the absolute path.
 function toStoredPath(absolutePath, sessionId) {
     const base = sessionFilesDir(sessionId);
-    if (isInsideDir(base, absolutePath)) {
-        const rel = relative(base, absolutePath);
+    const rel = insideRelative(base, absolutePath);
+    if (rel !== null) {
         return rel === "" ? basename(absolutePath) : rel;
     }
     return absolutePath;

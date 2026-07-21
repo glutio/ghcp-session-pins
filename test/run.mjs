@@ -535,6 +535,24 @@ group("Pin dialog order + pin_file path normalization");
     await tool.pin_file.handler({ path: "@@note.md" }, inv);
     check("pin_file strips a doubled leading @@", readPins().some((p) => p.type === "file"));
 
+    // A file genuinely inside <session>/files, given via an absolute path whose
+    // casing differs from the session dir, must still be stored as a RELATIVE pin
+    // (never absolute) — otherwise the session/home path would leak. On win32
+    // path.relative is already case-insensitive; on macOS the case-insensitive
+    // retry in insideRelative() covers it. On case-sensitive Linux this pins by
+    // the exact path, which is correct there.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "Cased.md"), "hi");
+    const filesDir = join(state.sessionRoot, "files");
+    const mixedAbs = process.platform === "win32"
+        ? join(filesDir.toUpperCase(), "Cased.md")   // flip drive/prefix case
+        : join(filesDir, "Cased.md");
+    await tool.pin_file.handler({ path: mixedAbs }, inv);
+    const casedPin = readPins().find((p) => p.type === "file");
+    check("pin_file stores a case-variant in-session path as a file pin", !!casedPin);
+    check("pin_file does not store an in-session file as an absolute pin", casedPin && !casedPin.path.includes(":") && !casedPin.path.startsWith("/"));
+
     // Bare '@' (no filename) is still rejected cleanly.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
