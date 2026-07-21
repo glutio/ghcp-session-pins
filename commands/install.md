@@ -1,6 +1,7 @@
 ---
 name: install
 description: Activate or update session-pins — sync its extension into your Copilot extensions folder (safe to run anytime; installs, auto-updates a stale copy, or reports it's already up to date).
+argument-hint: ""
 ---
 
 Activate the **session-pins** extension for this Copilot CLI. Copilot CLI does not yet
