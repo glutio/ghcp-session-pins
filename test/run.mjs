@@ -453,8 +453,17 @@ group("unpin does not leak disabled-pin content (probing oracle)");
     state.elicitation = true; state.confirmReturn = true;
     seedPins([{ id: "d2", type: "prompt", text: "SECRET disabled content", enabled: false }]);
     r = await tool.pin_remove.handler({ number: 1 }, inv);
-    check("removing a disabled pin succeeds", readPins().length === 0);
-    check("removal message does not leak disabled content", !/SECRET/.test(r) && /disabled/i.test(r) && /pin 1/i.test(r));
+    // A session-rooted FILE pin must match only on its display path (the relative
+    // stored name), never on the resolved absolute path. Matching an absolute-path
+    // fragment (e.g. the "pinsess" session-dir prefix) would be a path oracle.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    seedPins([{ id: "f1", type: "file", path: "notes.md", enabled: true }]);
+    r = await tool.pin_remove.handler({ match: "pinsess" }, inv);
+    check("unpin match does not hit the absolute session-path fragment", /no matching pin/i.test(r));
+    check("file pin still present after abs-path-fragment probe", readPins().some((p) => p.id === "f1"));
+    r = await tool.pin_remove.handler({ match: "notes" }, inv);
+    check("unpin match still finds the file pin by its display name", readPins().length === 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -1191,10 +1191,15 @@ const tools = [
                     if (!isEnabled(p)) {
                         return false;
                     }
+                    // Match file pins on their DISPLAY path only (session-relative
+                    // for internal pins; absolute solely when the user pinned an
+                    // external absolute path). Matching the resolved absolute path
+                    // would turn `match` into an oracle for the hidden session/home
+                    // path even though that path is never printed.
                     const hay =
                         p.type === "prompt"
                             ? p.text
-                            : `${p.path} ${resolveFilePin(p, invocation.sessionId)}`;
+                            : pinPathDisplay(p, invocation.sessionId);
                     return hay.toLowerCase().includes(needle);
                 });
             } else {
