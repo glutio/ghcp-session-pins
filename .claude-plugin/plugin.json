@@ -1,6 +1,6 @@
 {
   "name": "session-pins",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Pin editable instructions and live files into every prompt of a Copilot CLI session. Adds a /pin command and agent-callable pin tools.",
   "author": {
     "name": "Eugene Pistrak",
