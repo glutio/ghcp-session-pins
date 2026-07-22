@@ -7,10 +7,11 @@ Copilot has no memory within a session beyond the rolling context. Session Pins 
 on every turn until you remove them.
 
 - **Prompt pin** — an editable instruction added to every prompt (e.g. *"don't reinvent X, follow Y.md"*).
-- **Live file pin** — a file re-read from disk on every prompt, so edits to it stay reflected automatically.
+- **Live file pin** — a file re-read from disk on every prompt, so edits to it stay reflected automatically (up to the first 64 KB is injected; larger files are truncated).
 
 Pins are stored in the **session folder** as `pins.json` — the session's workspace directory
-(`session.workspacePath`) when available, otherwise `~/.copilot/session-state/<id>/`. Either way
+(`session.workspacePath`) when available, otherwise `<COPILOT_HOME>/session-state/<id>/`
+(defaulting to `~/.copilot/session-state/<id>/` when `COPILOT_HOME` is unset). Either way
 they travel with the session, survive resuming it, and vanish when it's deleted. A new session starts empty.
 
 ## Install
@@ -70,13 +71,11 @@ For direct, interactive control there's a single `/pin` command:
 /pin clear            Remove all
 ```
 
-In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **enable/disable** it (a quick way to silence a pin without deleting it), edit it in place, or delete it; `Esc` exits.
+In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state — `●` active, `○` disabled. Selecting a pin lets you **open** it in an editor (file pins only), edit it in place, **enable/disable** it (a quick way to silence a pin without deleting it), or delete it; `Esc` exits.
 
-### Enabling, disabling, and diagnosing pins
+### Enabling and disabling pins
 
-A disabled pin is kept in the list but not injected into prompts — handy for temporarily silencing a rule without losing it. Only you change this state, from the pinboard.
-
-When Copilot is diagnosing a problem, it can also *test* whether a pin is the culprit: the `test_without_pin` tool omits a single pin from **just the next turn** and then restores it automatically. This is in-memory only and never written to disk, so the agent can experiment safely — it can't leave a pin "stuck off", and it can never permanently disable a pin (that's yours to control).
+A disabled pin is kept in the list but not injected into prompts — handy for temporarily silencing a rule without losing it. Only you change this state, from the pinboard. To diagnose whether a pin is causing a problem, disable it for a turn or two and see if the behavior changes, then re-enable it.
 
 ## Alternative: force-load an instructions file from the session folder
 
