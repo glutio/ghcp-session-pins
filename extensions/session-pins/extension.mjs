@@ -392,6 +392,34 @@ function pinLabel(pin, index, sessionId) {
     return `${mark} ${number} @${display}`;
 }
 
+// Build pinboard / list labels with a per-file cost suffix, plus the running total
+// bytes across ENABLED pins (what's actually injected each prompt). File pins show
+// their approximate injected size; prompt pins are tiny and show none. Disabled
+// pins are silenced, so they add nothing to the total and get no cost suffix.
+async function buildLabeledPins(store, sessionId) {
+    let totalBytes = 0;
+    const labels = [];
+    for (let index = 0; index < store.pins.length; index++) {
+        const pin = store.pins[index];
+        let suffix = "";
+        if (isEnabled(pin)) {
+            const bytes = await pinBytes(pin, sessionId);
+            totalBytes += bytes;
+            if (pin.type === "file") {
+                suffix = ` (~${formatBytes(bytes)})`;
+            }
+        }
+        labels.push(pinLabel(pin, index, sessionId) + suffix);
+    }
+    return { labels, totalBytes };
+}
+
+// One-line running-total summary shown in the pinboard title and the /pin list
+// footer. Bytes only — an exact figure, rather than a fake-precise token estimate.
+function pinTotalSummary(totalBytes) {
+    return `\u2248 ${formatBytes(totalBytes)} added to every prompt`;
+}
+
 function cleanPathArgument(raw) {
     let value = raw.trim();
     if (value.startsWith("@")) {
@@ -735,11 +763,11 @@ async function openPinboard(ctx) {
 
     while (true) {
         const store = await loadStore(ctx.sessionId);
-        const pinItems = store.pins.map((pin, index) => pinLabel(pin, index, ctx.sessionId));
-        const choice = await choose(
-            store.pins.length ? "Session pins" : "No pins yet",
-            [...pinItems, ADD],
-        );
+        const { labels: pinItems, totalBytes } = await buildLabeledPins(store, ctx.sessionId);
+        const title = store.pins.length
+            ? `Session pins — ${pinTotalSummary(totalBytes)}`
+            : "No pins yet";
+        const choice = await choose(title, [...pinItems, ADD]);
 
         if (choice === null) {
             return;
@@ -821,8 +849,12 @@ async function listPins(ctx) {
         });
         return;
     }
-    const lines = store.pins.map((pin, index) => `  ${pinLabel(pin, index, ctx.sessionId)}`);
-    await session.log(`Session pins:\n${lines.join("\n")}`, { level: "info" });
+    const { labels, totalBytes } = await buildLabeledPins(store, ctx.sessionId);
+    const lines = labels.map((label) => `  ${label}`);
+    await session.log(
+        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(totalBytes)}`,
+        { level: "info" },
+    );
 }
 
 // Parse a 1-based pin index from text. Returns a 0-based index, or -1 if invalid.

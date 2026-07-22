@@ -356,6 +356,20 @@ group("Enable / disable pins");
     check("/pin list shows filled-circle glyph for enabled", listLog.includes("\u25cf"));
     check("/pin list shows hollow-circle glyph for disabled", listLog.includes("\u25cb"));
 
+    // /pin list shows a running byte total, and a per-file size on file pins.
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "big.md"), "x".repeat(3000));
+    seedPins([
+        { id: "p1", type: "prompt", text: "a rule", enabled: true },
+        { id: "f1", type: "file", path: "big.md", enabled: true },
+    ]);
+    state.logs.length = 0;
+    await runPin({ args: "list", sessionId: inv.sessionId });
+    const costLog = state.logs.join("\n");
+    check("/pin list shows a running context total", /added to every prompt/.test(costLog));
+    check("/pin list shows a per-file size on file pins", /@big\.md \(~/.test(costLog));
+    check("/pin list does not add a size to prompt pins", /"a rule"(?! \(~)/.test(costLog));
+
     // Pinboard toggle: pick the pin, choose Disable -> persisted + no longer
     // injected, and the dialog returns to the list so the change is visible.
     freshSession();
