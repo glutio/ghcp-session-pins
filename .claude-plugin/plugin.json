@@ -19,5 +19,5 @@
     "productivity",
     "extension"
   ],
-  "postInstallMessage": "session-pins installed. Make sure Copilot is running in experimental mode — start it with  copilot --experimental , or toggle it in-session with  /experimental  — then use /pin."
+  "postInstallMessage": "session-pins installed. Make sure Copilot is running in experimental mode — start it with  copilot --experimental , or turn it on in-session with  /experimental on  — then use /pin."
 }
