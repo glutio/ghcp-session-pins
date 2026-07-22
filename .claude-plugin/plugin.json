@@ -19,5 +19,5 @@
     "productivity",
     "extension"
   ],
-  "postInstallMessage": "session-pins installed. The /pin command and pin tools load automatically — no activation step needed. Relaunch Copilot (or start a new session) so the extension loads, then use /pin or just ask Copilot to pin an instruction or file. Requires Copilot CLI 1.0.74 or newer."
+  "postInstallMessage": "session-pins installed. Make sure Copilot is running in experimental mode — start it with  copilot --experimental , or set  \"experimental\": true  in ~/.copilot/settings.json — then use /pin."
 }
