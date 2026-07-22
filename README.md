@@ -76,6 +76,16 @@ After that, `/pin` is available and you can also just ask Copilot in plain langu
 (*"pin the rule that …"*, *"what's pinned?"*). Re-running `/session-pins:install` later
 updates the extension in place after a plugin upgrade.
 
+> **Note for automated evaluations / sandboxes.** The pin *tools* (`pin_file`, `pin_prompt`,
+> `pin_list`, `pin_remove`, `pin_clear`) live in this plugin's **extension**, which Copilot CLI
+> does **not** auto-load: it must be copied into `~/.copilot/extensions/` (by `/session-pins:install`
+> or the bundled installer) and then loaded on a `--experimental` relaunch. An automated harness that
+> only runs `/plugin install` — without executing the activation script and restarting — loads the
+> skill and command but **not** the extension, so the pin tools are absent and pin-related tasks
+> won't trigger them. This is a current Copilot CLI limitation (plugin-provided extensions don't
+> auto-load), **not** a defect in this plugin; runtime evals will under-report until the CLI
+> supports auto-loading plugin extensions, at which point this manual step (and this note) go away.
+
 ### Local / from source
 
 From the plugin folder:
