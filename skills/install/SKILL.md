@@ -47,3 +47,35 @@ plugin was upgraded, or reports that it's already up to date. Do this now:
    `/pin add @<path>`, or just asking Copilot in plain language).
 
 Do not modify the user's `settings.json` or run anything other than the bundled installer.
+
+## Response template
+
+Keep your replies predictable by reporting these fields in order (omit any that don't apply):
+
+- **Installer path** — the full path you resolved (or that you could not find one).
+- **Permission** — that you asked before running it, and whether the user approved.
+- **Result** — one of `installed`, `updated`, `already up to date`, or `failed`.
+- **Next step** — relaunch with `copilot --experimental` for `installed`/`updated`; nothing for
+  `already up to date` (unless `/pin` is missing); or the remediation below for `failed`.
+- **Usage** — the `/pin` usage lines the installer printed, once the extension is active.
+
+## Failure handling
+
+If any step cannot complete, **report what happened, suggest the most likely fix, and stop** —
+do not silently retry, guess another path, or run anything other than the bundled installer.
+
+- **No installer found** (the glob matches nothing): the plugin may not be installed, or
+  `COPILOT_HOME` may point somewhere unexpected. Tell the user, and suggest they confirm the
+  plugin is installed (`copilot plugin list` should show `session-pins`) and check whether
+  `COPILOT_HOME` is set to a non-default location. Do not invent a path.
+- **User declines permission**: do not run the installer. Explain that activation can't proceed
+  without it, and that they can run `install.ps1` / `install.sh` from the plugin folder themselves,
+  then relaunch with `copilot --experimental`.
+- **Installer exits non-zero or prints an error** (e.g. it *Refuses to install* because
+  `COPILOT_HOME` is a filesystem root / non-absolute / contains `..`, or a permissions/execution
+  error): surface the installer's own message verbatim, and point at the likely cause — an
+  unusual `COPILOT_HOME`, or (on Windows) PowerShell execution policy blocking the script (they can
+  run it with `pwsh -ExecutionPolicy Bypass -File <path>`). Do not work around a refusal.
+- **Installer output is unrecognized** (none of the three success phrases): report the raw output
+  and do not claim success; suggest re-running once and, if it persists, checking the plugin
+  install.

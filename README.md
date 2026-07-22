@@ -50,6 +50,32 @@ installed plugin folder (`…/installed-plugins/<marketplace>/session-pins/`):
 "$HOME/.copilot/installed-plugins/<marketplace>/session-pins/install.sh"
 ```
 
+#### End-to-end walkthrough
+
+What activation looks like from a fresh marketplace install:
+
+```text
+you  ▸ /plugin install session-pins@agency-playground
+CLI  ◂ Plugin "session-pins" installed successfully.
+        session-pins installed. One-time activation is needed … Run: /session-pins:install
+
+you  ▸ /session-pins:install
+CLI  ◂ I found the installer at
+        ~/.copilot/installed-plugins/agency-playground/session-pins/install.ps1
+        May I run it? (it copies the extension into ~/.copilot/extensions/session-pins)
+you  ▸ yes
+CLI  ◂ [OK] session-pins extension installed to ~/.copilot/extensions/session-pins
+        Next step: relaunch with  copilot --experimental
+
+you  ▸ (exit, then) copilot --experimental
+you  ▸ /pin add remember to run tests before committing
+CLI  ◂ Pinned pin 1: "remember to run tests before committing".
+```
+
+After that, `/pin` is available and you can also just ask Copilot in plain language
+(*"pin the rule that …"*, *"what's pinned?"*). Re-running `/session-pins:install` later
+updates the extension in place after a plugin upgrade.
+
 ### Local / from source
 
 From the plugin folder:
