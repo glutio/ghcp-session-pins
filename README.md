@@ -23,81 +23,27 @@ agency copilot
 /plugin install session-pins@agency-playground
 ```
 
-**One-time activation.** Installing registers the plugin, but Copilot CLI doesn't yet
-auto-load a plugin's *extension* (the part that provides the `/pin` command and the pin
-tools) — that's still behind a feature flag. And for safety the CLI never runs a plugin's
-scripts for you. So the plugin ships a one-time activation command — run it and approve when
-Copilot asks:
+That's it — the pin tools and the `/pin` command load automatically. Start a new
+Copilot session (so the extension loads at startup) and use `/pin`.
 
-```text
-/session-pins:install
+**Requires Copilot CLI 1.0.74+ with experimental mode enabled.** Extensions only
+load in experimental mode, so launch with `copilot --experimental`, or enable it
+persistently in `~/.copilot/settings.json`:
+
+```json
+{ "experimental": true }
 ```
 
-It copies the extension into `~/.copilot/extensions/` (where Copilot loads it on startup). Then
-relaunch Copilot with **`--experimental`** (extensions only load in experimental mode; you can
-also toggle it in-session with `/experimental`). Running `/session-pins:install` again later is
-safe and is also how you **update**: if you upgrade the plugin, re-run it and it refreshes the
-installed extension automatically (no flags needed); if nothing changed it just says it's already
-up to date.
-
-Prefer to do it by hand? Run the bundled installer directly instead — it's at the root of the
-installed plugin folder (`…/installed-plugins/<marketplace>/session-pins/`):
-
-```powershell
-& "$HOME\.copilot\installed-plugins\<marketplace>\session-pins\install.ps1"
-```
-```bash
-"$HOME/.copilot/installed-plugins/<marketplace>/session-pins/install.sh"
-```
-
-#### End-to-end walkthrough
-
-What activation looks like from a fresh marketplace install:
-
-```text
-you  ▸ /plugin install session-pins@agency-playground
-CLI  ◂ Plugin "session-pins" installed successfully.
-        session-pins installed. One-time activation is needed … Run: /session-pins:install
-
-you  ▸ /session-pins:install
-CLI  ◂ I found the installer at
-        ~/.copilot/installed-plugins/agency-playground/session-pins/install.ps1
-        May I run it? (it copies the extension into ~/.copilot/extensions/session-pins)
-you  ▸ yes
-CLI  ◂ [OK] session-pins extension installed to ~/.copilot/extensions/session-pins
-        Next step: relaunch with  copilot --experimental
-
-you  ▸ (exit, then) copilot --experimental
-you  ▸ /pin add remember to run tests before committing
-CLI  ◂ Pinned pin 1: "remember to run tests before committing".
-```
-
-After that, `/pin` is available and you can also just ask Copilot in plain language
-(*"pin the rule that …"*, *"what's pinned?"*). Re-running `/session-pins:install` later
-updates the extension in place after a plugin upgrade.
-
-> **Note for automated evaluations / sandboxes.** The pin *tools* (`pin_file`, `pin_prompt`,
-> `pin_list`, `pin_remove`, `pin_clear`) live in this plugin's **extension**, which Copilot CLI
-> does **not** auto-load: it must be copied into `~/.copilot/extensions/` (by `/session-pins:install`
-> or the bundled installer) and then loaded on a `--experimental` relaunch. An automated harness that
-> only runs `/plugin install` — without executing the activation script and restarting — loads the
-> skill and command but **not** the extension, so the pin tools are absent and pin-related tasks
-> won't trigger them. This is a current Copilot CLI limitation (plugin-provided extensions don't
-> auto-load), **not** a defect in this plugin; runtime evals will under-report until the CLI
-> supports auto-loading plugin extensions, at which point this manual step (and this note) go away.
+No activation script, no manual copying — the extension ships inside the plugin at
+`extensions/session-pins/` and Copilot loads it from the installed plugin directly.
 
 ### Local / from source
 
-From the plugin folder:
-
-```powershell
-.\install.ps1        # Windows
-```
-```bash
-./install.sh         # Linux / macOS
+```text
+/plugin install /path/to/session-pins
 ```
 
-Then run `copilot --experimental`.
+Then start a new session with experimental mode enabled (as above).
 
 ## Use
 

@@ -59,7 +59,7 @@ writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({ version: 1,
 ] }));
 
 // Import the real extension (loader maps the SDK specifier to sdk-mock.mjs).
-await import(new URL("../extension/extension.mjs", import.meta.url));
+await import(new URL("../extensions/session-pins/extension.mjs", import.meta.url));
 const startupLogs = [...state.logs];
 const { tools, hooks } = globalThis.__pins;
 const tool = Object.fromEntries(tools.map((t) => [t.name, t]));
