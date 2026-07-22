@@ -229,6 +229,45 @@ function resolveInputPath(rawPath, sessionId) {
     return isAbsolute(rawPath) ? rawPath : resolve(sessionFilesDir(sessionId), rawPath);
 }
 
+function delay(ms) {
+    return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+// The model often issues the file-creating tool call (create/write) and pin_file
+// as parallel tool calls in the SAME turn; the runtime executes them concurrently,
+// so pin_file's existence check can run before the create's write has landed on
+// disk, yielding a spurious ENOENT for a file that is about to exist. Retry the
+// stat a few times on ENOENT ONLY (other errors fail fast) so a concurrent create
+// can win the race before we report the file missing. Bounded to ~1.6s worst case,
+// and only incurred on the error path — an already-present file passes on attempt 1.
+async function statWithRetry(absolutePath) {
+    const retryDelaysMs = [40, 80, 160, 320, 500, 500];
+    let attempt = 0;
+    for (;;) {
+        try {
+            return await stat(absolutePath);
+        } catch (error) {
+            if (error?.code === "ENOENT" && attempt < retryDelaysMs.length) {
+                await delay(retryDelaysMs[attempt++]);
+                continue;
+            }
+            throw error;
+        }
+    }
+}
+
+// Message for a file-pin failure. For ENOENT we add guidance, because after a
+// spurious race-ENOENT the model tends to "correct" a working relative name
+// (e.g. `notes.txt`) into a wrong one (`files/notes.txt`) that resolves to
+// <session>/files/files/notes.txt — steer it back to the session-rooted rule.
+function pinFileError(absolutePath, sessionId, error) {
+    const base = `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(error)}.`;
+    if (error?.code === "ENOENT") {
+        return `${base} A relative path is rooted at the session files folder, so pass just the file name (e.g. \`notes.txt\`, not \`files/notes.txt\`), or an absolute path for a file elsewhere; the file must already exist on disk.`;
+    }
+    return base;
+}
+
 // A relative input path is contractually rooted at <session>/files, so a ".."
 // segment would let it escape that folder and be stored as an absolute pin —
 // bypassing the load-time traversal guard (which only rejects "..") in stored
@@ -468,11 +507,11 @@ async function buildPin(raw, sessionId) {
         const absolutePath = resolveInputPath(rawPath, sessionId);
         let info;
         try {
-            info = await stat(absolutePath);
+            info = await statWithRetry(absolutePath);
         } catch (error) {
             return {
                 ok: false,
-                error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(error)}.`,
+                error: pinFileError(absolutePath, sessionId, error),
             };
         }
         if (!info.isFile()) {

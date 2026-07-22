@@ -161,6 +161,19 @@ group("Consent gates (model-initiated pins)");
     writeFileSync(join(state.sessionRoot, "files", "note.md"), "hello");
     out = await tool.pin_file.handler({ path: "note.md" }, inv);
     check("pin_file (no UI) refuses without asking", state.confirmCalls.length === 0 && /confirmation/i.test(out));
+
+    // pin_file: absorbs a create/pin race. Models issue the create and the
+    // pin_file as parallel tool calls in one turn; the runtime runs them
+    // concurrently, so pin_file's stat can execute before the create's write has
+    // landed (a spurious ENOENT). The file here appears ~120ms AFTER the call
+    // starts; statWithRetry must wait for it rather than fail.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    const racePath = join(state.sessionRoot, "files", "race.md");
+    setTimeout(() => { try { writeFileSync(racePath, "late"); } catch { /* ignore */ } }, 120);
+    out = await tool.pin_file.handler({ path: "race.md" }, inv);
+    check("pin_file absorbs a create/pin race (retries on ENOENT)", readPins().some((p) => p.type === "file"));
+    check("pin_file race pin uses the @path voice", out.includes("@race.md"));
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +645,7 @@ group("Pin dialog order + pin_file path normalization");
     check("pin_file (missing file) reports an error code, not a message", /error code \w+/.test(missOut));
     check("pin_file (missing file) does not leak the absolute path", !missOut.includes(state.sessionRoot));
     check("pin_file (missing file) uses the relative display path", missOut.includes("missing.md") && readPins().length === 0);
+    check("pin_file (missing file) guides toward the session-rooted rule", /session files folder/i.test(missOut) && /must already exist/i.test(missOut));
 
     // /pin remove <n> reports the pin number in the deletion message.
     freshSession();
