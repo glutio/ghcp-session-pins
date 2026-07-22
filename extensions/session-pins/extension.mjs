@@ -229,45 +229,6 @@ function resolveInputPath(rawPath, sessionId) {
     return isAbsolute(rawPath) ? rawPath : resolve(sessionFilesDir(sessionId), rawPath);
 }
 
-function delay(ms) {
-    return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
-// The model often issues the file-creating tool call (create/write) and pin_file
-// as parallel tool calls in the SAME turn; the runtime executes them concurrently,
-// so pin_file's existence check can run before the create's write has landed on
-// disk, yielding a spurious ENOENT for a file that is about to exist. Retry the
-// stat a few times on ENOENT ONLY (other errors fail fast) so a concurrent create
-// can win the race before we report the file missing. Bounded to ~1.6s worst case,
-// and only incurred on the error path — an already-present file passes on attempt 1.
-async function statWithRetry(absolutePath) {
-    const retryDelaysMs = [40, 80, 160, 320, 500, 500];
-    let attempt = 0;
-    for (;;) {
-        try {
-            return await stat(absolutePath);
-        } catch (error) {
-            if (error?.code === "ENOENT" && attempt < retryDelaysMs.length) {
-                await delay(retryDelaysMs[attempt++]);
-                continue;
-            }
-            throw error;
-        }
-    }
-}
-
-// Message for a file-pin failure. For ENOENT we add guidance, because after a
-// spurious race-ENOENT the model tends to "correct" a working relative name
-// (e.g. `notes.txt`) into a wrong one (`files/notes.txt`) that resolves to
-// <session>/files/files/notes.txt — steer it back to the session-rooted rule.
-function pinFileError(absolutePath, sessionId, error) {
-    const base = `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(error)}.`;
-    if (error?.code === "ENOENT") {
-        return `${base} A relative path is rooted at the session files folder, so pass just the file name (e.g. \`notes.txt\`, not \`files/notes.txt\`), or an absolute path for a file elsewhere; the file must already exist on disk.`;
-    }
-    return base;
-}
-
 // A relative input path is contractually rooted at <session>/files, so a ".."
 // segment would let it escape that folder and be stored as an absolute pin —
 // bypassing the load-time traversal guard (which only rejects "..") in stored
@@ -441,12 +402,19 @@ async function buildLabeledPins(store, sessionId) {
     for (let index = 0; index < store.pins.length; index++) {
         const pin = store.pins[index];
         let suffix = "";
-        if (isEnabled(pin)) {
-            const bytes = await pinBytes(pin, sessionId);
-            totalBytes += bytes;
-            if (pin.type === "file") {
+        if (pin.type === "file") {
+            // A missing file (not yet created, or moved/deleted) is flagged so a
+            // typo or a never-created optimistic pin is visible — shown whether the
+            // pin is enabled or not, since it's a status signal, not file content.
+            if (!(await filePinExists(pin, sessionId))) {
+                suffix = " (not found)";
+            } else if (isEnabled(pin)) {
+                const bytes = await pinBytes(pin, sessionId);
+                totalBytes += bytes;
                 suffix = ` (~${formatBytes(bytes)})`;
             }
+        } else if (isEnabled(pin)) {
+            totalBytes += await pinBytes(pin, sessionId);
         }
         labels.push(pinLabel(pin, index, sessionId) + suffix);
     }
@@ -507,11 +475,25 @@ async function buildPin(raw, sessionId) {
         const absolutePath = resolveInputPath(rawPath, sessionId);
         let info;
         try {
-            info = await statWithRetry(absolutePath);
+            info = await stat(absolutePath);
         } catch (error) {
+            // A not-yet-existing file is allowed: the model may create the file
+            // and pin it as parallel tool calls in one turn, so pin_file's stat
+            // can run before the create's write lands. Rather than fail (or wait),
+            // pin optimistically and mark it missing — the pinboard/list flag it as
+            // "(not found)" and the per-prompt render reads it once it exists (which,
+            // for a concurrent create, is the very next prompt). Only ENOENT is
+            // tolerated; any other fs error (e.g. EACCES) is a genuine problem.
+            if (error?.code === "ENOENT") {
+                return {
+                    ok: true,
+                    missing: true,
+                    pin: makeFilePin(toStoredPath(absolutePath, sessionId)),
+                };
+            }
             return {
                 ok: false,
-                error: pinFileError(absolutePath, sessionId, error),
+                error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(error)}.`,
             };
         }
         if (!info.isFile()) {
@@ -647,6 +629,18 @@ async function pinBytes(pin, sessionId) {
     }
 }
 
+// Does a file pin's target currently exist on disk as a readable file? Used to flag
+// "(not found)" in the pinboard / list for a pin whose file is missing — either a
+// not-yet-created file (pinned optimistically to avoid the create/pin race) or a
+// stale pin whose file was moved/deleted. Best-effort: any error counts as missing.
+async function filePinExists(pin, sessionId) {
+    try {
+        return (await stat(resolveFilePin(pin, sessionId))).isFile();
+    } catch {
+        return false;
+    }
+}
+
 function elicitationEnabled() {
     return Boolean(session.capabilities.ui?.elicitation);
 }
@@ -757,21 +751,27 @@ async function editPin(ctx, store, index) {
         return;
     }
 
-    let info;
+    let missing = false;
     try {
-        info = await stat(absolutePath);
+        const info = await stat(absolutePath);
+        if (!info.isFile()) {
+            await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: it isn't a file.`, { level: "error" });
+            return;
+        }
     } catch (error) {
-        await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: ${fsErrorReason(error)}.`, { level: "error" });
-        return;
-    }
-    if (!info.isFile()) {
-        await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: it isn't a file.`, { level: "error" });
-        return;
+        // Consistent with pin_file: a not-yet-existing target is allowed (flagged
+        // "(not found)" in the pinboard); any other fs error is a genuine problem.
+        if (error?.code !== "ENOENT") {
+            await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: ${fsErrorReason(error)}.`, { level: "error" });
+            return;
+        }
+        missing = true;
     }
 
     pin.path = toStoredPath(absolutePath, ctx.sessionId);
     await saveStore(ctx.sessionId, store);
-    await session.log(`Updated pin ${index + 1}: ${fileDescriptor(absolutePath, ctx.sessionId)}.`, { level: "info" });
+    const note = missing ? ' (not found yet — shows as "(not found)" until the file exists)' : "";
+    await session.log(`Updated pin ${index + 1}: ${fileDescriptor(absolutePath, ctx.sessionId)}.${note}`, { level: "info" });
 }
 
 async function deletePin(ctx, store, index) {
@@ -1158,14 +1158,14 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (up to the first 64 KB is injected; larger files are truncated). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
+            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (up to the first 64 KB is injected; larger files are truncated). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. This tool pins a file that ALREADY EXISTS on disk: if you need to create the file first, create it in a separate, earlier step and let that tool call finish, THEN call pin_file in a later step — do NOT issue the file-creating tool call and pin_file together in the same batch of tool calls, or pin_file may run before the file has been written. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
         parameters: {
             type: "object",
             properties: {
                 path: {
                     type: "string",
                     description:
-                        "Path to the file to pin. Relative paths resolve against the session's files folder; use an absolute path for files outside it.",
+                        "Path to the file to pin; the file must already exist (create it in a separate earlier step, not in the same batch as this call). Relative paths resolve against the session's files folder — pass just the file name (e.g. `notes.txt`, not `files/notes.txt`); use an absolute path for files outside it.",
                 },
             },
         },
@@ -1201,11 +1201,14 @@ const tools = [
             // Surface the file size so the user sees the per-turn context cost before
             // approving; a pinned file's full contents are re-injected every prompt.
             let sizeNote = "";
-            try {
-                sizeNote = ` (${formatBytes((await stat(target)).size)}, re-read into context every prompt until unpinned)`;
-            } catch {
-                // Non-fatal: buildPin already validated the file is readable; if the
-                // size can't be read now, just omit the note.
+            if (result.missing) {
+                sizeNote = " (file not found yet — it will be read into context once it exists)";
+            } else {
+                try {
+                    sizeNote = ` (${formatBytes((await stat(target)).size)}, re-read into context every prompt until unpinned)`;
+                } catch {
+                    // Non-fatal: if the size can't be read now, just omit the note.
+                }
             }
             const gate = await confirmModelAction(
                 `Allow Copilot to pin this file${sizeNote}?\n${target}`,
@@ -1215,6 +1218,11 @@ const tools = [
                 return gate.message;
             }
             const status = await addPinToStore(invocation.sessionId, result.pin);
+            if (result.missing && status.added) {
+                // Pinned optimistically: tell the model the file isn't there yet so it
+                // creates it (in a separate step) rather than assuming the pin failed.
+                return `${status.message} The file doesn't exist yet, so it shows as "(not found)" and nothing is injected until it exists — create it in a separate step if you haven't already.`;
+            }
             return status.message;
         },
     },

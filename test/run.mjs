@@ -162,18 +162,27 @@ group("Consent gates (model-initiated pins)");
     out = await tool.pin_file.handler({ path: "note.md" }, inv);
     check("pin_file (no UI) refuses without asking", state.confirmCalls.length === 0 && /confirmation/i.test(out));
 
-    // pin_file: absorbs a create/pin race. Models issue the create and the
-    // pin_file as parallel tool calls in one turn; the runtime runs them
-    // concurrently, so pin_file's stat can execute before the create's write has
-    // landed (a spurious ENOENT). The file here appears ~120ms AFTER the call
-    // starts; statWithRetry must wait for it rather than fail.
+    // pin_file: optimistic pin of a not-yet-existing file. Models often issue the
+    // file-creating tool call and pin_file as parallel tool calls in one turn; the
+    // runtime runs them concurrently, so pin_file's stat can execute before the
+    // create's write lands. Rather than fail or wait, pin_file pins optimistically,
+    // reports the file isn't there yet, and the pin is flagged "(not found)" until
+    // the file exists (which, for a concurrent create, is the very next prompt).
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
-    const racePath = join(state.sessionRoot, "files", "race.md");
-    setTimeout(() => { try { writeFileSync(racePath, "late"); } catch { /* ignore */ } }, 120);
-    out = await tool.pin_file.handler({ path: "race.md" }, inv);
-    check("pin_file absorbs a create/pin race (retries on ENOENT)", readPins().some((p) => p.type === "file"));
-    check("pin_file race pin uses the @path voice", out.includes("@race.md"));
+    out = await tool.pin_file.handler({ path: "not-created-yet.md" }, inv);
+    check("pin_file pins a not-yet-existing file (optimistic, no wait)", readPins().some((p) => p.type === "file"));
+    check("pin_file (missing) tells the model the file isn't there yet", /not found|doesn't exist/i.test(out));
+    check("pin_file (missing) still uses the @path voice", out.includes("@not-created-yet.md"));
+    check("pin_file (missing) does not leak the absolute session path", !out.includes(state.sessionRoot));
+
+    // Once the file exists, the same path pins normally with a size note, no warning.
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "real.md"), "hello");
+    out = await tool.pin_file.handler({ path: "real.md" }, inv);
+    check("pin_file (existing) pins without a not-found warning", readPins().length === 1 && !/not found|doesn't exist/i.test(out));
+    check("pin_file (existing) confirm prompt shows a size, not a not-found note", /\bB\b|KB|MB/.test(state.confirmCalls[0]) && !/not found/i.test(state.confirmCalls[0]));
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +391,22 @@ group("Enable / disable pins");
     check("/pin list shows a running context total", /added to every prompt/.test(costLog));
     check("/pin list shows a per-file size on file pins", /@big\.md \(~/.test(costLog));
     check("/pin list does not add a size to prompt pins", /"a rule"(?! \(~)/.test(costLog));
+
+    // /pin list flags a file pin whose file doesn't exist (optimistic pin, or a
+    // moved/deleted file) as "(not found)" instead of a size, and it is excluded
+    // from the running byte total.
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "here.md"), "x".repeat(2048));
+    seedPins([
+        { id: "f1", type: "file", path: "here.md", enabled: true },
+        { id: "f2", type: "file", path: "gone.md", enabled: true },   // never created
+    ]);
+    state.logs.length = 0;
+    await runPin({ args: "list", sessionId: inv.sessionId });
+    const missLog = state.logs.join("\n");
+    check("/pin list flags a missing file pin as (not found)", /@gone\.md \(not found\)/.test(missLog));
+    check("/pin list still sizes the present file pin", /@here\.md \(~/.test(missLog));
+    check("/pin list total counts only the present file (~2 KB)", /2 KB added to every prompt/.test(missLog));
 
     // Pinboard toggle: pick the pin, choose Disable -> persisted + no longer
     // injected, and the dialog returns to the list so the change is visible.
@@ -636,16 +661,17 @@ group("Pin dialog order + pin_file path normalization");
     check("pin_file traversal attempt pins nothing", readPins().length === 0);
     check("pin_file traversal did not even ask to confirm", state.confirmCalls.length === 0);
 
-    // A missing session-rooted file must report only an fs error code and the
-    // relative display path — never the absolute session/home path (which fs
-    // error messages embed) and never the raw error message.
+    // A path that exists but ISN'T a regular file (a directory) is a genuine error
+    // and must be refused — this is the surviving hard-fail path now that a merely
+    // missing file is pinned optimistically. The message must not leak the absolute
+    // session/home path and must not pin anything.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
-    const missOut = await tool.pin_file.handler({ path: "missing.md" }, inv);
-    check("pin_file (missing file) reports an error code, not a message", /error code \w+/.test(missOut));
-    check("pin_file (missing file) does not leak the absolute path", !missOut.includes(state.sessionRoot));
-    check("pin_file (missing file) uses the relative display path", missOut.includes("missing.md") && readPins().length === 0);
-    check("pin_file (missing file) guides toward the session-rooted rule", /session files folder/i.test(missOut) && /must already exist/i.test(missOut));
+    mkdirSync(join(state.sessionRoot, "files", "adir"));
+    const dirOut = await tool.pin_file.handler({ path: "adir" }, inv);
+    check("pin_file (directory) is refused", /isn't a file/i.test(dirOut) && readPins().length === 0);
+    check("pin_file (directory) does not leak the absolute path", !dirOut.includes(state.sessionRoot));
+    check("pin_file (directory) uses the relative display path", dirOut.includes("adir"));
 
     // /pin remove <n> reports the pin number in the deletion message.
     freshSession();
