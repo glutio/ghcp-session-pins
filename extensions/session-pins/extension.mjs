@@ -1112,10 +1112,17 @@ async function renderPinnedContext(sessionId) {
                 `<live_file_pin number="${number}" path="${escapeXmlAttr(displayPath)}"${truncatedAttr}>\n${escapeXml(contents)}\n</live_file_pin>`,
             );
         } catch (error) {
-            // Report only the error code (e.g. ENOENT/EACCES), never error.message —
-            // Node fs messages embed the absolute path, which would leak the home
-            // dir/username into the prompt for session-rooted pins (the path
-            // attribute already avoids this).
+            // A missing file (ENOENT) is expected for an optimistically-pinned file
+            // that hasn't been created yet (or was moved/deleted): inject NOTHING so
+            // we don't spam every prompt with an unreadable block. The pinboard and
+            // /pin list already flag it as "(not found)". Any OTHER fs error (e.g.
+            // EACCES — the file exists but can't be read) is a genuine problem, so
+            // surface a compact notice. Report only the error code (never
+            // error.message, which embeds the absolute path and would leak the home
+            // dir/username; the path attribute already avoids this).
+            if (error?.code === "ENOENT") {
+                continue;
+            }
             const reason = fsErrorReason(error);
             sections.push(
                 `<live_file_pin number="${number}" path="${escapeXmlAttr(displayPath)}" unreadable="true">\n` +

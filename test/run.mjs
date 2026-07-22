@@ -193,15 +193,17 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     // '&' is legal in a Windows filename and must be escaped in the path attribute.
     const ampName = "a & b.md";
     writeFileSync(join(state.sessionRoot, "files", ampName), 'content with <tag> & "quote"');
-    // An unreadable pin whose stored (absolute) path has " < > ' & exercises the
-    // catch branch + attribute escaping without needing such a file to exist.
-    const trickyAbs = "C:\\no\\such\\weird\" <x> 'y' & z.md";
+    // A pin whose target exists but ISN'T a readable regular file (a directory ->
+    // EISDIR) exercises the render catch branch's compact "unreadable" notice. (A
+    // merely MISSING file is ENOENT and is now injected as nothing — covered
+    // separately below — so a directory is used here to reach the unreadable path.)
+    mkdirSync(join(state.sessionRoot, "files", "adir"));
     const pinsJson = {
         version: 1,
         pins: [
             { id: "p1", type: "prompt", text: "valid prompt <b>&</b>" },
             { id: "f1", type: "file", path: ampName },
-            { id: "f2", type: "file", path: trickyAbs },
+            { id: "f2", type: "file", path: "adir" },  // directory -> unreadable (EISDIR)
             { id: "bad1", type: "file", path: 123 },   // non-string path -> drop
             { id: "bad2", type: "file" },              // no path -> drop
             { type: "prompt", text: "no id" },         // no id -> drop
@@ -223,10 +225,11 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     check("readable file content is rendered", out.includes("content with"));
     check("file content angle brackets escaped", out.includes("&lt;tag&gt;"));
     check("'&' in path attribute is escaped", out.includes("a &amp; b.md"));
-    check("'\"' in path attribute is escaped", out.includes("&quot;"));
-    check("''' in path attribute is escaped", out.includes("&apos;"));
-    check("'<>' in path attribute is escaped", out.includes("&lt;x&gt;"));
-    check("no raw quote breaks the path attribute", !out.includes('weird" <x>'));
+    // (Path attributes containing " ' < > can't be produced on Windows: any such
+    // path fails to stat and — for a missing file — now injects nothing, so those
+    // cases are unreachable through render here. escapeXmlAttr still handles them.)
+    check("a non-readable (directory) file pin renders an unreadable notice", /unreadable="true"/.test(out) && out.includes("could not be read"));
+    check("unreadable notice emits an error code, not a message", /could not be read \(error code \w+\)/.test(out));
     check("exactly one prompt-pin survives", (out.match(/<prompt_pin /g) || []).length === 1);
     check("exactly two file-pins survive", (out.match(/<live_file_pin /g) || []).length === 2);
     check("injected pins are numbered, not guid-identified", /<prompt_pin number="\d+">/.test(out) && !/ id=/.test(out));
@@ -236,14 +239,14 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     check("session-rooted path is not leaked as absolute", !out.includes(state.sessionRoot));
     check("session-rooted path shown relative in attribute", out.includes('path="a &amp; b.md"'));
 
-    // An unreadable session-rooted pin must not leak the absolute path via the
-    // error text (fs error messages embed it) — only an error code is emitted.
+    // A missing (not-yet-created, or moved/deleted) file pin must inject NOTHING —
+    // no unreadable block spamming every prompt. It stays in pins.json and shows as
+    // "(not found)" in the pinboard/list; the render simply skips it until it exists.
     freshSession();
     seedPins([{ id: "missing", type: "file", path: "does-not-exist.md" }]);
     const outMissing = await render();
-    check("unreadable pin reports it could not be read", /could not be read/.test(outMissing));
-    check("unreadable pin emits an error code, not a message", /error code \w+/.test(outMissing));
-    check("unreadable pin does not leak the absolute session path", !outMissing.includes(state.sessionRoot));
+    check("a missing file pin injects nothing (no unreadable block)", !/<live_file_pin/.test(outMissing));
+    check("a missing file pin produces no session_pins section on its own", outMissing === "");
     // The every-turn preamble must tell the agent to consider pins as a possible
     // cause when debugging, and to surface (not silently ignore) a conflicting pin.
     check("preamble frames pins as active instructions", /treat it as active instructions/i.test(out));
