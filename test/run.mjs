@@ -363,6 +363,15 @@ group("Enable / disable pins");
     check("pin_list shows the per-file size", listedFile.includes("`@notes.md` (~2 B)"));
     check("pin_list shows a running context total", /added to every prompt/.test(listedFile));
 
+    // A long prompt preview must truncate with ASCII "..." — never the Unicode
+    // ellipsis U+2026, whose ambiguous display width makes the host picker render a
+    // spurious blank line after the truncated option.
+    freshSession();
+    seedPins([{ id: "lp", type: "prompt", text: "L".repeat(400), enabled: true }]);
+    const listedLong = await tool.pin_list.handler({}, inv);
+    check("long prompt preview is truncated", /L{100}/.test(listedLong) && !new RegExp("L{400}").test(listedLong));
+    check("truncation uses ASCII dots, not a Unicode ellipsis", listedLong.includes("...") && !listedLong.includes("\u2026"));
+
     // A path containing a backtick must render as a valid, larger-fenced code span.
     freshSession();
     writeFileSync(join(state.sessionRoot, "files", "a`b.md"), "hi");

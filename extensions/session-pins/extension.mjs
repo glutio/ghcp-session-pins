@@ -352,9 +352,13 @@ async function saveStore(sessionId, store) {
 
 function shortText(text, maxLength = PREVIEW_LENGTH) {
     const oneLine = text.replace(/\s+/g, " ").trim();
+    // Use an ASCII "..." rather than a Unicode ellipsis (U+2026): the ellipsis has
+    // East-Asian "Ambiguous" width, so the host picker's width/wrap calculation can
+    // miscount it and render a spurious blank line after a truncated option. ASCII
+    // dots are unambiguously width-1 everywhere.
     return oneLine.length <= maxLength
         ? oneLine
-        : `${oneLine.slice(0, maxLength - 1)}…`;
+        : `${oneLine.slice(0, maxLength - 3)}...`;
 }
 
 // Escape XML metacharacters so pinned text/file contents can't break out of the
