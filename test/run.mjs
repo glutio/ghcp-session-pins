@@ -18,12 +18,14 @@ const state = {
     elicitation: true,
     confirmReturn: true,
     confirmCalls: [],
+    confirmEntered: null,
     logs: [],
     sentMessages: [],
     // Queue of responders for the interactive picker (choose -> session.ui.elicitation).
     // Each responder gets (message, options) and returns the option to pick, or null.
     // When the queue is exhausted, the picker is cancelled (returns null).
     elicitResponders: [],
+    inputResponders: [],
 };
 
 globalThis.__pins = {
@@ -32,9 +34,16 @@ globalThis.__pins = {
         get workspacePath() { return state.noWorkspace ? undefined : state.sessionRoot; },
         get capabilities() { return { ui: state.elicitation ? { elicitation: true } : {} }; },
         ui: {
-            async confirm(message) { state.confirmCalls.push(message); return state.confirmReturn; },
+            async confirm(message) {
+                state.confirmCalls.push(message);
+                state.confirmEntered?.();
+                return state.confirmReturn;
+            },
             async select() { return null; },
-            async input() { return null; },
+            async input(message, options) {
+                const responder = state.inputResponders.shift();
+                return responder ? responder(message, options) : null;
+            },
             async elicitation({ message, requestedSchema }) {
                 const options = (requestedSchema?.properties?.selection?.oneOf ?? []).map((o) => o.const);
                 const responder = state.elicitResponders.shift();
@@ -87,9 +96,11 @@ function freshSession() {
     state.sessionRoot = mkdtempSync(join(tmpdir(), "pinsess-"));
     mkdirSync(join(state.sessionRoot, "files"), { recursive: true });
     state.confirmCalls.length = 0;
+    state.confirmEntered = null;
     state.logs.length = 0;
     state.sentMessages.length = 0;
     state.elicitResponders.length = 0;
+    state.inputResponders.length = 0;
     state.noWorkspace = false;
     return state.sessionRoot;
 }
@@ -377,7 +388,7 @@ group("Enable / disable pins");
     const listedBt = await tool.pin_list.handler({}, inv);
     check("backtick path uses a larger fence (``@a`b.md``)", listedBt.includes("``@a`b.md``"));
 
-    // /pin list output shows the ✓ / ✗ glyphs.
+    // /pin list uses the same state glyphs as the native instructions UI.
     freshSession();
     seedPins([
         { id: "on1", type: "prompt", text: "active rule", enabled: true },
@@ -385,8 +396,8 @@ group("Enable / disable pins");
     ]);
     await runPin({ args: "list", sessionId: inv.sessionId });
     const listLog = state.logs.join("\n");
-    check("/pin list shows filled-circle glyph for enabled", listLog.includes("\u25cf"));
-    check("/pin list shows hollow-circle glyph for disabled", listLog.includes("\u25cb"));
+    check("/pin list shows native check glyph for enabled", listLog.includes("\u2713"));
+    check("/pin list shows native bullet glyph for disabled", listLog.includes("\u2022"));
 
     // /pin list shows a running byte total, and a per-file size on file pins.
     freshSession();
@@ -402,16 +413,65 @@ group("Enable / disable pins");
     check("/pin list shows a per-file size on file pins", /@big\.md \(~/.test(costLog));
     check("/pin list does not add a size to prompt pins", /"a rule"(?! \(~)/.test(costLog));
 
-    // A file pin over the 64 KB cap is flagged as truncated (with the real size and
+    // A file pin over the 128 KB default is flagged as truncated (with the real size and
     // the cap) in /pin list, and only the capped bytes count toward the total.
     freshSession();
-    writeFileSync(join(state.sessionRoot, "files", "huge.md"), "x".repeat(100 * 1024));
+    writeFileSync(join(state.sessionRoot, "files", "huge.md"), "x".repeat(200 * 1024));
     seedPins([{ id: "f1", type: "file", path: "huge.md", enabled: true }]);
     state.logs.length = 0;
     await runPin({ args: "list", sessionId: inv.sessionId });
     const truncLog = state.logs.join("\n");
-    check("/pin list flags an over-cap file as truncated to the cap", /@huge\.md \(~100 KB, truncated to 64 KB\)/.test(truncLog));
-    check("/pin list total counts only the injected 64 KB", /64 KB added to every prompt/.test(truncLog));
+    check("/pin list flags an over-cap file as truncated to the cap", /@huge\.md \(~200 KB, truncated to 128 KB\)/.test(truncLog));
+    check("/pin list total counts only the injected 128 KB", /128 KB added to every prompt/.test(truncLog));
+    check("/pin list summary counts truncated file pins", /1 file pin truncated/.test(truncLog));
+    const modelTrunc = await tool.pin_list.handler({}, inv);
+    check("pin_list uses the same real-size + truncation label", /@huge\.md` \(~200 KB, truncated to 128 KB\)/.test(modelTrunc));
+    const renderedTrunc = await render();
+    check("prompt rendering uses the default 128 KB limit", renderedTrunc.includes("file exceeds 131072 bytes"));
+
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "add-large.md"), "x".repeat(200 * 1024));
+    await runPin({ args: "@add-large.md", sessionId: inv.sessionId });
+    check("direct add warns when a file will be truncated", state.logs.some((m) => /only the first 128 KB will be injected/.test(m)));
+
+    freshSession();
+    state.elicitation = true; state.confirmReturn = true;
+    writeFileSync(join(state.sessionRoot, "files", "tool-large.md"), "x".repeat(200 * 1024));
+    const largeToolResult = await tool.pin_file.handler({ path: "tool-large.md" }, inv);
+    check("pin_file result warns when a file will be truncated", /only the first 128 KB will be injected/.test(largeToolResult));
+
+    // settings.maxFileBytes changes the session-wide default used by both rendering
+    // and status output.
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "configured.md"), "x".repeat(100 * 1024));
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({
+        version: 1,
+        settings: { maxFileBytes: 96 * 1024 },
+        pins: [{ id: "configured", type: "file", path: "configured.md", enabled: true }],
+    }));
+    state.logs.length = 0;
+    await runPin({ args: "list", sessionId: inv.sessionId });
+    check("pins.json config changes the displayed truncation limit", /truncated to 96 KB/.test(state.logs.join("\n")));
+    check("pins.json config changes the rendered truncation marker", (await render()).includes("file exceeds 98304 bytes"));
+
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "invalid-limit.md"), "x".repeat(200 * 1024));
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({
+        version: 1,
+        settings: { maxFileBytes: 32 * 1024 * 1024 },
+        pins: [{
+            id: "invalid-limit",
+            type: "file",
+            path: "invalid-limit.md",
+            enabled: true,
+            maxFileBytes: 0,
+        }],
+    }));
+    state.logs.length = 0;
+    const invalidLimitList = await tool.pin_list.handler({}, inv);
+    check("invalid session limit falls back to 128 KB", /truncated to 128 KB/.test(invalidLimitList));
+    check("invalid per-pin override preserves the pin", /@invalid-limit\.md/.test(invalidLimitList));
+    check("invalid limits produce warnings", state.logs.some((m) => /invalid settings\.maxFileBytes/.test(m)) && state.logs.some((m) => /invalid maxFileBytes override/.test(m)));
 
     // /pin list flags file pins that can't be read: a missing file as "(not found)"
     // and an existing-but-unreadable one (a directory) as "(read error)". Both are
@@ -433,6 +493,10 @@ group("Enable / disable pins");
     check("/pin list still sizes the present file pin", /@here\.md \(~/.test(missLog));
     check("/pin list total counts only the present file (~2 KB)", /2 KB added to every prompt/.test(missLog));
     check("/pin list summary counts pins that can't be read", /2 pins can't be read/.test(missLog));
+    const modelMiss = await tool.pin_list.handler({}, inv);
+    check("pin_list uses the same missing-file label", /@gone\.md` \(not found\)/.test(modelMiss));
+    check("pin_list uses the same read-error label", /@adir` \(read error\)/.test(modelMiss));
+    check("pin_list uses the same unreadable-pin count", /2 pins can't be read/.test(modelMiss));
 
     // Pinboard toggle: pick the pin, choose Disable -> persisted + no longer
     // injected, and the dialog returns to the list so the change is visible.
@@ -601,6 +665,41 @@ group("Pin dialog order + pin_file path normalization");
     await runPin({ args: "", sessionId: inv.sessionId });
     check("file pin dialog order is Open, Edit, Disable, Delete", JSON.stringify(detailOptions) === JSON.stringify(["Open", "Edit", "Disable", "Delete"]));
 
+    // A truncated file offers the configured bounded per-pin override. Raising it
+    // persists that ceiling, injects this 200 KB file in full, and exposes restore.
+    freshSession();
+    state.elicitation = true;
+    writeFileSync(join(state.sessionRoot, "files", "large.md"), "x".repeat(200 * 1024));
+    writeFileSync(join(state.sessionRoot, "pins.json"), JSON.stringify({
+        version: 1,
+        settings: {
+            maxFileBytes: 128 * 1024,
+            maxFileCeilingBytes: 2 * 1024 * 1024,
+        },
+        pins: [{ id: "limit", type: "file", path: "large.md", enabled: true }],
+    }));
+    let raisedOptions = null;
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")),
+        (_m, opts) => { raisedOptions = opts.slice(); return opts.find((o) => /Raise file limit/.test(o)); },
+        () => null,
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("truncated file menu uses the configured 2 MB ceiling", raisedOptions?.includes("Raise file limit to 2 MB"));
+    check("raising the file limit persists the configured ceiling", readPins()[0]?.maxFileBytes === 2 * 1024 * 1024);
+    check("raised file is injected without a truncation marker", !(await render()).includes("[truncated:"));
+
+    let restoredOptions = null;
+    state.elicitResponders = [
+        (_m, opts) => opts.find((o) => !o.startsWith("+")),
+        (_m, opts) => { restoredOptions = opts.slice(); return opts.find((o) => /Use default file limit/.test(o)); },
+        () => null,
+    ];
+    await runPin({ args: "", sessionId: inv.sessionId });
+    check("overridden file menu offers restoring the 128 KB default", restoredOptions?.includes("Use default file limit (128 KB)"));
+    check("restoring the default removes the per-pin override", readPins()[0]?.maxFileBytes === undefined);
+    check("restored file is truncated again", (await render()).includes("file exceeds 131072 bytes"));
+
     // Selecting Open hands the file to the agent (session.send) and exits, without
     // changing the pin.
     freshSession();
@@ -615,7 +714,8 @@ group("Pin dialog order + pin_file path normalization");
     check("Open asks the agent to open the file", state.sentMessages.some((m) => /open this file in an editor/i.test(m) && m.includes("doc.md")));
     check("Open leaves the pin unchanged", readPins().length === 1 && readPins()[0].id === "fo2");
 
-    // pin_file must tolerate a leading @ (or @@) on the path argument.
+    // pin_file accepts one optional leading @ as syntax. A doubled @@ preserves one
+    // literal @ so a real filename beginning with @ remains addressable.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
     writeFileSync(join(state.sessionRoot, "files", "note.md"), "hi");
@@ -624,9 +724,9 @@ group("Pin dialog order + pin_file path normalization");
 
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
-    writeFileSync(join(state.sessionRoot, "files", "note.md"), "hi");
+    writeFileSync(join(state.sessionRoot, "files", "@note.md"), "hi");
     await tool.pin_file.handler({ path: "@@note.md" }, inv);
-    check("pin_file strips a doubled leading @@", readPins().some((p) => p.type === "file"));
+    check("pin_file preserves a literal @ from doubled @@", readPins().some((p) => p.path === "@note.md"));
 
     // A file genuinely inside <session>/files, given via an absolute path whose
     // casing differs from the session dir, must still be stored as a RELATIVE pin
@@ -699,6 +799,27 @@ group("Pin dialog order + pin_file path normalization");
     check("pin_file (directory) does not leak the absolute path", !dirOut.includes(state.sessionRoot));
     check("pin_file (directory) uses the relative display path", dirOut.includes("adir"));
 
+    // File-pin edits use the same target preparation/probe as pin_file, so an
+    // existing directory is rejected rather than becoming a pin that can never
+    // inject content.
+    freshSession();
+    state.elicitation = true;
+    writeFileSync(join(state.sessionRoot, "files", "old.md"), "old");
+    mkdirSync(join(state.sessionRoot, "files", "adir"));
+    seedPins([{ id: "edit-file", type: "file", path: "old.md", enabled: true }]);
+    state.inputResponders = [() => "adir"];
+    await runPin({ args: "edit 1", sessionId: inv.sessionId });
+    check("file edit rejects a directory through the shared probe", readPins()[0]?.path === "old.md");
+    check("file edit reports the shared not-a-file error", state.logs.some((m) => /isn't a file/i.test(m)));
+
+    freshSession();
+    state.elicitation = true;
+    writeFileSync(join(state.sessionRoot, "files", "@note.md"), "at file");
+    seedPins([{ id: "edit-at", type: "file", path: "@note.md", enabled: true }]);
+    state.inputResponders = [(_message, options) => options.default];
+    await runPin({ args: "edit 1", sessionId: inv.sessionId });
+    check("unchanged edit round-trips a filename beginning with @", readPins()[0]?.path === "@note.md");
+
     // /pin remove <n> reports the pin number in the deletion message.
     freshSession();
     state.elicitation = true; state.confirmReturn = true;
@@ -709,6 +830,63 @@ group("Pin dialog order + pin_file path normalization");
     await runPin({ args: "remove 2", sessionId: inv.sessionId });
     check("delete message names the pin number", state.logs.some((m) => /Unpinned pin 2:/.test(m)));
     check("the right pin was removed", readPins().length === 1 && readPins()[0].id === "a");
+}
+
+// ---------------------------------------------------------------------------
+group("Confirmed mutations use stable pin identities");
+{
+    const runPin = globalThis.__pins.commands.find((c) => c.name === "pin").handler;
+    const deferred = () => {
+        let resolve;
+        const promise = new Promise((done) => { resolve = done; });
+        return { promise, resolve };
+    };
+
+    // While pin_remove waits for confirmation, another direct action removes the
+    // preceding pin. The confirmed tool action must still remove its original ID,
+    // not whichever pin moved into the old numeric position.
+    freshSession();
+    state.elicitation = true;
+    seedPins([
+        { id: "first", type: "prompt", text: "first", enabled: true },
+        { id: "target", type: "prompt", text: "target", enabled: true },
+        { id: "third", type: "prompt", text: "third", enabled: true },
+    ]);
+    let gate = deferred();
+    let entered = deferred();
+    state.confirmEntered = entered.resolve;
+    state.confirmReturn = gate.promise;
+    const removing = tool.pin_remove.handler({ number: 2 }, inv);
+    await entered.promise;
+    state.elicitation = false;
+    await runPin({ args: "remove 1", sessionId: inv.sessionId });
+    gate.resolve(true);
+    await removing;
+    check("pin_remove deletes the confirmed ID after index shifts", readPins().length === 1 && readPins()[0].id === "third");
+
+    // pin_clear snapshots the IDs covered by its confirmation. A pin added while
+    // the dialog is open was not part of that approval and must survive.
+    freshSession();
+    state.elicitation = true;
+    seedPins([
+        { id: "old-a", type: "prompt", text: "old a", enabled: true },
+        { id: "old-b", type: "prompt", text: "old b", enabled: true },
+    ]);
+    gate = deferred();
+    entered = deferred();
+    state.confirmEntered = entered.resolve;
+    state.confirmReturn = gate.promise;
+    const clearing = tool.pin_clear.handler({}, inv);
+    await entered.promise;
+    await runPin({ args: "new while confirming", sessionId: inv.sessionId });
+    gate.resolve(true);
+    const clearResult = await clearing;
+    const afterClear = readPins();
+    check("pin_clear removes only IDs covered by confirmation", afterClear.length === 1 && afterClear[0].text === "new while confirming");
+    check("pin_clear reports the number actually approved and removed", /^Cleared 2 pins\.$/.test(clearResult));
+
+    state.confirmReturn = true;
+    state.elicitation = true;
 }
 
 // ---------------------------------------------------------------------------

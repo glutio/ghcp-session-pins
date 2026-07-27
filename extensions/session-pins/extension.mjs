@@ -43,9 +43,12 @@ const saveQueues = new Map();
 // at the same, generous length.
 const PREVIEW_LENGTH = 240;
 
-// Max bytes of a pinned file injected into a prompt. Larger files are truncated
-// with a notice so an accidentally-pinned huge file can't blow up the context.
-const MAX_PINNED_FILE_BYTES = 64 * 1024;
+// File injection is bounded so an accidentally-pinned huge file cannot consume the
+// prompt. The session default is persisted in pins.json and can be configured up to
+// the fixed safety ceiling. Individual file pins can opt into that ceiling.
+const DEFAULT_MAX_PINNED_FILE_BYTES = 128 * 1024;
+const DEFAULT_MAX_PINNED_FILE_CEILING_BYTES = 1024 * 1024;
+const HARD_MAX_PINNED_FILE_BYTES = 16 * 1024 * 1024;
 // Generous, non-blocking advisory threshold: when all active pins together add
 // more than this to every prompt, pin_list / the startup notice mention it. This
 // never blocks pinning — it's purely a heads-up about context cost.
@@ -73,6 +76,29 @@ function makePromptPin(text) {
 
 function makeFilePin(storedPath) {
     return { id: randomUUID(), type: "file", path: storedPath, enabled: true };
+}
+
+function isValidFileByteSetting(value) {
+    return (
+        Number.isInteger(value) &&
+        value > 0 &&
+        value <= HARD_MAX_PINNED_FILE_BYTES
+    );
+}
+
+function defaultStore() {
+    return {
+        version: 1,
+        settings: {
+            maxFileBytes: DEFAULT_MAX_PINNED_FILE_BYTES,
+            maxFileCeilingBytes: DEFAULT_MAX_PINNED_FILE_CEILING_BYTES,
+        },
+        pins: [],
+    };
+}
+
+function effectiveFileLimit(store, pin) {
+    return pin.maxFileBytes ?? store.settings.maxFileBytes;
 }
 
 // A pin is active (injected every turn) unless it has been explicitly disabled by
@@ -251,16 +277,76 @@ async function loadStore(sessionId) {
     }
 
     const load = (async () => {
-        let store = { version: 1, pins: [] };
+        let store = defaultStore();
         try {
             const parsed = JSON.parse(await readFile(path, "utf8"));
             if (parsed?.version === 1 && Array.isArray(parsed.pins)) {
-                const valid = parsed.pins.filter(isValidPin);
-                store = { version: 1, pins: valid };
+                const configuredLimit = parsed.settings?.maxFileBytes;
+                const validConfiguredLimit =
+                    configuredLimit === undefined || isValidFileByteSetting(configuredLimit);
+                const maxFileBytes =
+                    validConfiguredLimit && configuredLimit !== undefined
+                        ? configuredLimit
+                        : DEFAULT_MAX_PINNED_FILE_BYTES;
+                const configuredCeiling = parsed.settings?.maxFileCeilingBytes;
+                const validConfiguredCeiling =
+                    configuredCeiling === undefined ||
+                    (
+                        isValidFileByteSetting(configuredCeiling) &&
+                        configuredCeiling >= maxFileBytes
+                    );
+                const maxFileCeilingBytes =
+                    validConfiguredCeiling && configuredCeiling !== undefined
+                        ? configuredCeiling
+                        : Math.max(DEFAULT_MAX_PINNED_FILE_CEILING_BYTES, maxFileBytes);
+
+                let invalidOverrides = 0;
+                const valid = parsed.pins.filter(isValidPin).map((pin) => {
+                    if (
+                        pin.type === "file" &&
+                        pin.maxFileBytes !== undefined &&
+                        (
+                            !isValidFileByteSetting(pin.maxFileBytes) ||
+                            pin.maxFileBytes > maxFileCeilingBytes
+                        )
+                    ) {
+                        const normalized = { ...pin };
+                        delete normalized.maxFileBytes;
+                        invalidOverrides++;
+                        return normalized;
+                    }
+                    return pin;
+                });
+                store = {
+                    version: 1,
+                    settings: {
+                        maxFileBytes,
+                        maxFileCeilingBytes,
+                    },
+                    pins: valid,
+                };
                 const dropped = parsed.pins.length - valid.length;
                 if (dropped > 0) {
                     await session.log(
                         `session-pins: dropped ${dropped} malformed pin${dropped === 1 ? "" : "s"} from pins.json.`,
+                        { level: "warning", ephemeral: true },
+                    );
+                }
+                if (!validConfiguredLimit) {
+                    await session.log(
+                        `session-pins: invalid settings.maxFileBytes in pins.json; using ${DEFAULT_MAX_PINNED_FILE_BYTES} bytes (valid range: 1-${HARD_MAX_PINNED_FILE_BYTES}).`,
+                        { level: "warning", ephemeral: true },
+                    );
+                }
+                if (!validConfiguredCeiling) {
+                    await session.log(
+                        `session-pins: invalid settings.maxFileCeilingBytes in pins.json; using ${maxFileCeilingBytes} bytes (it must be at least maxFileBytes and no more than ${HARD_MAX_PINNED_FILE_BYTES}).`,
+                        { level: "warning", ephemeral: true },
+                    );
+                }
+                if (invalidOverrides > 0) {
+                    await session.log(
+                        `session-pins: ignored invalid maxFileBytes override on ${invalidOverrides} file pin${invalidOverrides === 1 ? "" : "s"}; using the session default.`,
                         { level: "warning", ephemeral: true },
                     );
                 }
@@ -386,11 +472,10 @@ function escapeXmlAttr(value) {
 
 function pinLabel(pin, index, sessionId) {
     const number = `${index + 1}.`;
-    // Filled circle for an active pin, hollow circle for a disabled one. (Not a ✓
-    // — the host's single-select widget uses ✓ as its own selection marker, so
-    // reusing it here would be ambiguous.) Plain monochrome glyphs; the interactive
-    // picker renders option labels as text and doesn't reliably honor ANSI color.
-    const mark = isEnabled(pin) ? "\u25cf" : "\u25cb";
+    // Match the native instructions UI: a check for enabled, a bullet for disabled.
+    // The glyph prefixes pin state; the host's separate selection marker remains in
+    // its own column.
+    const mark = isEnabled(pin) ? "\u2713" : "\u2022";
     if (pin.type === "prompt") {
         return `${mark} ${number} "${shortText(pin.text)}"`;
     }
@@ -401,48 +486,76 @@ function pinLabel(pin, index, sessionId) {
     return `${mark} ${number} @${display}`;
 }
 
-// Build pinboard / list labels with a per-file cost suffix, plus the running total
-// bytes across ENABLED pins (what's actually injected each prompt). File pins show
-// their approximate injected size; prompt pins are tiny and show none. Disabled
-// pins are silenced, so they add nothing to the total and get no cost suffix.
-async function buildLabeledPins(store, sessionId) {
+// Build one shared status/cost summary for every pin. Human-facing labels,
+// model-facing pin_list, and the startup notice all consume this data so missing,
+// unreadable, and truncated files cannot be described differently by each surface.
+async function summarizePins(store, sessionId) {
     let totalBytes = 0;
-    // Count of ENABLED file pins whose content can't be read (missing OR
-    // inaccessible) — surfaced as a single number in the summary line. Such a pin
-    // silently contributes nothing to the prompt, so the count warns the user.
     let unreadable = 0;
-    const labels = [];
+    let truncated = 0;
+    const items = [];
     for (let index = 0; index < store.pins.length; index++) {
         const pin = store.pins[index];
-        let suffix = "";
+        const enabled = isEnabled(pin);
+        let status = "ok";
+        let size = 0;
+        let injectedBytes = 0;
+        let limit = 0;
         if (pin.type === "file") {
-            // A file pin's status is flagged so a typo, a never-created optimistic
-            // pin, or a moved/deleted/locked file is visible — shown whether the pin
-            // is enabled or not, since it's a status signal, not file content.
-            // "(not found)" = missing; "(read error)" = exists but couldn't be read
-            // (a directory, permissions error, etc.).
-            const { status, size } = await filePinInfo(pin, sessionId);
-            if (status === "missing" || status === "unreadable") {
-                suffix = status === "missing" ? " (not found)" : " (read error)";
-                if (isEnabled(pin)) {
-                    unreadable++;
-                }
-            } else if (isEnabled(pin)) {
-                // A file over the cap is injected only up to MAX_PINNED_FILE_BYTES, so
-                // count the capped bytes in the total and flag the truncation with the
-                // real size + the cap (e.g. "(~150 KB, truncated to 64 KB)").
-                const injected = Math.min(size, MAX_PINNED_FILE_BYTES);
-                totalBytes += injected;
-                suffix = size > MAX_PINNED_FILE_BYTES
-                    ? ` (~${formatBytes(size)}, truncated to ${formatBytes(MAX_PINNED_FILE_BYTES)})`
-                    : ` (~${formatBytes(injected)})`;
+            limit = effectiveFileLimit(store, pin);
+            ({ status, size } = await filePinInfo(pin, sessionId));
+            if (enabled && status !== "ok") {
+                unreadable++;
             }
-        } else if (isEnabled(pin)) {
-            totalBytes += await pinBytes(pin, sessionId);
+            if (enabled && status === "ok") {
+                injectedBytes = Math.min(size, limit);
+                if (size > limit) {
+                    truncated++;
+                }
+            }
+        } else if (enabled) {
+            injectedBytes = Buffer.byteLength(String(pin.text ?? ""), "utf8");
         }
-        labels.push(pinLabel(pin, index, sessionId) + suffix);
+        totalBytes += injectedBytes;
+        items.push({
+            pin,
+            index,
+            enabled,
+            status,
+            size,
+            limit,
+            injectedBytes,
+            truncated: status === "ok" && size > limit,
+        });
     }
-    return { labels, totalBytes, unreadable };
+    return { items, totalBytes, unreadable, truncated };
+}
+
+function fileSummarySuffix(item) {
+    if (item.status === "missing") {
+        return " (not found)";
+    }
+    if (item.status !== "ok") {
+        return " (read error)";
+    }
+    if (!item.enabled) {
+        return "";
+    }
+    return item.truncated
+        ? ` (~${formatBytes(item.size)}, truncated to ${formatBytes(item.limit)})`
+        : ` (~${formatBytes(item.injectedBytes)})`;
+}
+
+async function buildLabeledPins(store, sessionId) {
+    const summary = await summarizePins(store, sessionId);
+    return {
+        ...summary,
+        labels: summary.items.map(
+            (item) =>
+                pinLabel(item.pin, item.index, sessionId) +
+                (item.pin.type === "file" ? fileSummarySuffix(item) : ""),
+        ),
+    };
 }
 
 // One-line running-total summary shown in the pinboard title and the /pin list
@@ -450,11 +563,16 @@ async function buildLabeledPins(store, sessionId) {
 // Appends a count of enabled pins that can't be read (missing or read error), so
 // the user notices silently-dropped context; no need to split the two kinds here —
 // the per-pin labels already distinguish "(not found)" vs "(read error)".
-function pinTotalSummary(totalBytes, unreadable = 0) {
+function pinTotalSummary(totalBytes, unreadable = 0, truncated = 0) {
     const base = `\u2248 ${formatBytes(totalBytes)} added to every prompt`;
-    return unreadable > 0
-        ? `${base} \u00b7 ${unreadable} pin${unreadable === 1 ? "" : "s"} can't be read`
-        : base;
+    const notices = [];
+    if (unreadable > 0) {
+        notices.push(`${unreadable} pin${unreadable === 1 ? "" : "s"} can't be read`);
+    }
+    if (truncated > 0) {
+        notices.push(`${truncated} file pin${truncated === 1 ? "" : "s"} truncated`);
+    }
+    return notices.length > 0 ? `${base} \u00b7 ${notices.join(" \u00b7 ")}` : base;
 }
 
 function cleanPathArgument(raw) {
@@ -479,67 +597,89 @@ function cleanPathArgument(raw) {
     return value;
 }
 
+// Probe a target once using both metadata and an actual read handle. stat() alone
+// accepts chmod/ACL-protected files that renderPinnedContext cannot read; open()
+// alone cannot reliably distinguish a directory on every platform.
+async function probeFilePath(absolutePath) {
+    let info;
+    try {
+        info = await stat(absolutePath);
+    } catch (error) {
+        return {
+            status: error?.code === "ENOENT" ? "missing" : "unreadable",
+            size: 0,
+            errorCode: error?.code,
+        };
+    }
+    if (!info.isFile()) {
+        return { status: "not-file", size: 0 };
+    }
+
+    let handle;
+    try {
+        handle = await open(absolutePath, "r");
+        await handle.close();
+        return { status: "ok", size: info.size };
+    } catch (error) {
+        if (handle) {
+            try { await handle.close(); } catch {}
+        }
+        return { status: "unreadable", size: 0, errorCode: error?.code };
+    }
+}
+
+// Normalize and validate a user/model-supplied file path. Missing files are valid
+// optimistic pins; existing targets must be regular files that can be opened.
+async function prepareFilePin(raw, sessionId) {
+    const rawPath = cleanPathArgument(raw);
+    if (!rawPath) {
+        return { ok: false, error: "No file path was provided." };
+    }
+    if (hasRelativeTraversal(rawPath)) {
+        return {
+            ok: false,
+            error: "A relative pin path can't contain '..' (it's rooted at the session files folder). Pass an absolute path to pin a file outside the session.",
+        };
+    }
+
+    const absolutePath = resolveInputPath(rawPath, sessionId);
+    const fileInfo = await probeFilePath(absolutePath);
+    if (fileInfo.status === "not-file") {
+        return {
+            ok: false,
+            error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: it isn't a file.`,
+        };
+    }
+    if (fileInfo.status === "unreadable") {
+        return {
+            ok: false,
+            error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(fileInfo)}.`,
+        };
+    }
+    return {
+        ok: true,
+        absolutePath,
+        storedPath: toStoredPath(absolutePath, sessionId),
+        fileInfo,
+        missing: fileInfo.status === "missing",
+    };
+}
+
 // Turn raw user text into a pin object.
 // Text starting with "@" becomes a live file pin; everything else is a prompt pin.
-// Returns { ok, pin } on success or { ok: false, error } on failure.
 async function buildPin(raw, sessionId) {
     const trimmed = (raw ?? "").trim();
     if (!trimmed) {
         return { ok: false };
     }
-
-    if (trimmed.startsWith("@")) {
-        const rawPath = cleanPathArgument(trimmed);
-        if (!rawPath) {
-            return { ok: false, error: "No file path was provided." };
-        }
-        if (hasRelativeTraversal(rawPath)) {
-            return {
-                ok: false,
-                error: "A relative pin path can't contain '..' (it's rooted at the session files folder). Pass an absolute path to pin a file outside the session.",
-            };
-        }
-
-        // Session-rooted: a relative path resolves against the session files
-        // folder; an absolute path is used as-is.
-        const absolutePath = resolveInputPath(rawPath, sessionId);
-        let info;
-        try {
-            info = await stat(absolutePath);
-        } catch (error) {
-            // A not-yet-existing file is allowed: the model may create the file
-            // and pin it as parallel tool calls in one turn, so pin_file's stat
-            // can run before the create's write lands. Rather than fail (or wait),
-            // pin optimistically and mark it missing — the pinboard/list flag it as
-            // "(not found)" and the per-prompt render reads it once it exists (which,
-            // for a concurrent create, is the very next prompt). Only ENOENT is
-            // tolerated; any other fs error (e.g. EACCES) is a genuine problem.
-            if (error?.code === "ENOENT") {
-                return {
-                    ok: true,
-                    missing: true,
-                    pin: makeFilePin(toStoredPath(absolutePath, sessionId)),
-                };
-            }
-            return {
-                ok: false,
-                error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: ${fsErrorReason(error)}.`,
-            };
-        }
-        if (!info.isFile()) {
-            return {
-                ok: false,
-                error: `Can't pin ${fileDescriptor(absolutePath, sessionId)}: it isn't a file.`,
-            };
-        }
-
-        return {
-            ok: true,
-            pin: makeFilePin(toStoredPath(absolutePath, sessionId)),
-        };
+    if (!trimmed.startsWith("@")) {
+        return { ok: true, pin: makePromptPin(trimmed) };
     }
 
-    return { ok: true, pin: makePromptPin(trimmed) };
+    const prepared = await prepareFilePin(trimmed, sessionId);
+    return prepared.ok
+        ? { ...prepared, pin: makeFilePin(prepared.storedPath) }
+        : prepared;
 }
 
 // Quick-add path: `/pin <text>` or `/pin @<path>`.
@@ -553,7 +693,27 @@ async function addFromArgs(ctx, raw) {
     }
 
     const status = await addPinToStore(ctx.sessionId, result.pin);
-    await session.log(status.message, { level: "info" });
+    await session.log(await pinResultMessage(ctx.sessionId, result, status), { level: "info" });
+}
+
+async function pinResultMessage(sessionId, result, status) {
+    if (
+        !status.added ||
+        result.pin?.type !== "file" ||
+        result.fileInfo?.status !== "ok"
+    ) {
+        return status.message;
+    }
+    const store = await loadStore(sessionId);
+    const limit = effectiveFileLimit(store, result.pin);
+    if (result.fileInfo.size <= limit) {
+        return status.message;
+    }
+    return (
+        `${status.message} The file is ${formatBytes(result.fileInfo.size)}; ` +
+        `only the first ${formatBytes(limit)} will be injected. Use /pin and select it ` +
+        `to raise this pin's limit to ${formatBytes(store.settings.maxFileCeilingBytes)}.`
+    );
 }
 
 // Add a pin object to a session's store (deduping live files by their resolved
@@ -609,7 +769,8 @@ function pinPathDisplay(pin, sessionId) {
 // would leak the session/home path into model-visible output, so report only the
 // error code.
 function fsErrorReason(error) {
-    return error?.code ? `error code ${error.code}` : "an unknown error";
+    const code = error?.code ?? error?.errorCode;
+    return code ? `error code ${code}` : "an unknown error";
 }
 
 // One consistent way to describe a pin in a message: a prompt shows as its text in
@@ -635,6 +796,7 @@ function formatBytes(n) {
     if (!Number.isFinite(n) || n < 0) return "unknown size";
     if (n < 1024) return `${n} B`;
     if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+    if (n % (1024 * 1024) === 0) return `${n / (1024 * 1024)} MB`;
     return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -644,43 +806,9 @@ function approxTokens(bytes) {
     return Math.ceil(bytes / 4);
 }
 
-// Approximate bytes a pin adds to each prompt: the prompt text, or the file's
-// on-disk size capped at the injection cap (larger files are truncated on inject).
-// A file that can't actually be read (missing, directory, permissions) counts as 0,
-// using the SAME open()-based check as renderPinnedContext (via filePinInfo), so the
-// byte estimate never over-counts a stat-able-but-unreadable file the prompt skips.
-async function pinBytes(pin, sessionId) {
-    if (pin.type === "prompt") {
-        return Buffer.byteLength(String(pin.text ?? ""), "utf8");
-    }
-    const { status, size } = await filePinInfo(pin, sessionId);
-    return status === "ok" ? Math.min(size, MAX_PINNED_FILE_BYTES) : 0;
-}
-
-// Read status + size of a file pin's target the SAME way renderPinnedContext does
-// — by opening it — so the pinboard/list never disagree with what's actually
-// injected. status is "ok" (a regular file that can be opened for reading),
-// "missing" (ENOENT — not created yet, or moved/deleted), or "unreadable" (exists
-// but can't be opened/read as a file: a directory (EISDIR), a permissions error
-// (EACCES), etc.). Using stat() alone would be wrong here: stat succeeds on a
-// chmod-000 file, so the pinboard would show a size and skip the "can't be read"
-// count while render silently injected nothing. size is the byte size (meaningful
-// only when status is "ok"), used to show the injected size and flag truncation.
 async function filePinInfo(pin, sessionId) {
-    let handle;
-    try {
-        handle = await open(resolveFilePin(pin, sessionId), "r");
-    } catch (error) {
-        return { status: error?.code === "ENOENT" ? "missing" : "unreadable", size: 0 };
-    }
-    try {
-        const info = await handle.stat();
-        return info.isFile() ? { status: "ok", size: info.size } : { status: "unreadable", size: 0 };
-    } catch {
-        return { status: "unreadable", size: 0 };
-    } finally {
-        await handle.close();
-    }
+    const info = await probeFilePath(resolveFilePin(pin, sessionId));
+    return info.status === "not-file" ? { ...info, status: "unreadable" } : info;
 }
 
 function elicitationEnabled() {
@@ -762,25 +890,18 @@ async function editPin(ctx, store, index) {
     const editedPath = await session.ui.input("Edit the file path (@ optional):", {
         title: "Edit live file pin",
         minLength: 1,
-        default: pin.path,
+        default: `@${pinPathDisplay(pin, ctx.sessionId)}`,
     });
     if (editedPath === null) {
         return;
     }
 
-    const cleaned = cleanPathArgument(editedPath);
-    if (!cleaned) {
+    const prepared = await prepareFilePin(editedPath, ctx.sessionId);
+    if (!prepared.ok) {
+        await session.log(prepared.error, { level: "error" });
         return;
     }
-    if (hasRelativeTraversal(cleaned)) {
-        await session.log(
-            "A relative pin path can't contain '..' (it's rooted at the session files folder). Pass an absolute path to pin a file outside the session.",
-            { level: "error" },
-        );
-        return;
-    }
-
-    const absolutePath = resolveInputPath(cleaned, ctx.sessionId);
+    const { absolutePath } = prepared;
     if (samePath(absolutePath, resolveFilePin(pin, ctx.sessionId))) {
         return;
     }
@@ -793,27 +914,31 @@ async function editPin(ctx, store, index) {
         return;
     }
 
-    let missing = false;
-    try {
-        const info = await stat(absolutePath);
-        if (!info.isFile()) {
-            await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: it isn't a file.`, { level: "error" });
-            return;
-        }
-    } catch (error) {
-        // Consistent with pin_file: a not-yet-existing target is allowed (flagged
-        // "(not found)" in the pinboard); any other fs error is a genuine problem.
-        if (error?.code !== "ENOENT") {
-            await session.log(`Can't pin ${fileDescriptor(absolutePath, ctx.sessionId)}: ${fsErrorReason(error)}.`, { level: "error" });
-            return;
-        }
-        missing = true;
-    }
-
-    pin.path = toStoredPath(absolutePath, ctx.sessionId);
+    pin.path = prepared.storedPath;
     await saveStore(ctx.sessionId, store);
-    const note = missing ? ' (not found yet — shows as "(not found)" until the file exists)' : "";
+    const note = prepared.missing ? ' (not found yet — shows as "(not found)" until the file exists)' : "";
     await session.log(`Updated pin ${index + 1}: ${fileDescriptor(absolutePath, ctx.sessionId)}.${note}`, { level: "info" });
+}
+
+async function removePinById(sessionId, store, pinId) {
+    const currentIndex = store.pins.findIndex((pin) => pin.id === pinId);
+    if (currentIndex === -1) {
+        return null;
+    }
+    const [removed] = store.pins.splice(currentIndex, 1);
+    await saveStore(sessionId, store);
+    return { removed, index: currentIndex };
+}
+
+async function clearPinsById(sessionId, store, pinIds) {
+    const approved = new Set(pinIds);
+    const before = store.pins.length;
+    store.pins = store.pins.filter((pin) => !approved.has(pin.id));
+    const removed = before - store.pins.length;
+    if (removed > 0) {
+        await saveStore(sessionId, store);
+    }
+    return removed;
 }
 
 async function deletePin(ctx, store, index) {
@@ -827,8 +952,11 @@ async function deletePin(ctx, store, index) {
             return false;
         }
     }
-    store.pins.splice(index, 1);
-    await saveStore(ctx.sessionId, store);
+    const result = await removePinById(ctx.sessionId, store, pin.id);
+    if (!result) {
+        await session.log(`Pin ${index + 1} was already removed.`, { level: "info" });
+        return false;
+    }
     await session.log(`Unpinned pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}.`, { level: "info" });
     return true;
 }
@@ -844,9 +972,9 @@ async function openPinboard(ctx) {
 
     while (true) {
         const store = await loadStore(ctx.sessionId);
-        const { labels: pinItems, totalBytes, unreadable } = await buildLabeledPins(store, ctx.sessionId);
+        const { labels: pinItems, totalBytes, unreadable, truncated } = await buildLabeledPins(store, ctx.sessionId);
         const title = store.pins.length
-            ? `Session pins — ${pinTotalSummary(totalBytes, unreadable)}`
+            ? `Session pins — ${pinTotalSummary(totalBytes, unreadable, truncated)}`
             : "No pins yet";
         const choice = await choose(title, [...pinItems, ADD]);
 
@@ -877,11 +1005,28 @@ async function openPinboard(ctx) {
                     ? selected.text
                     : `@${pinPathDisplay(selected, ctx.sessionId)}`;
             const toggleLabel = isEnabled(selected) ? "Disable" : "Enable";
+            let limitAction = null;
+            let raisesLimit = false;
+            let fileInfo = null;
+            if (selected.type === "file") {
+                fileInfo = await filePinInfo(selected, ctx.sessionId);
+                const limit = effectiveFileLimit(store, selected);
+                if (
+                    fileInfo.status === "ok" &&
+                    fileInfo.size > limit &&
+                    limit < store.settings.maxFileCeilingBytes
+                ) {
+                    raisesLimit = true;
+                    limitAction = `Raise file limit to ${formatBytes(store.settings.maxFileCeilingBytes)}`;
+                } else if (selected.maxFileBytes !== undefined) {
+                    limitAction = `Use default file limit (${formatBytes(store.settings.maxFileBytes)})`;
+                }
+            }
             // "Open" (file pins only) hands the file off to the agent to open in an
             // editor however it chooses; a prompt pin has no file to open.
             const options =
                 selected.type === "file"
-                    ? ["Open", "Edit", toggleLabel, "Delete"]
+                    ? ["Open", "Edit", ...(limitAction ? [limitAction] : []), toggleLabel, "Delete"]
                     : ["Edit", toggleLabel, "Delete"];
             const action = await choose(detail, options);
 
@@ -898,6 +1043,28 @@ async function openPinboard(ctx) {
                 // Close the pinboard so the agent can act on the open request.
                 return;
             }
+            if (action === limitAction) {
+                if (raisesLimit) {
+                    selected.maxFileBytes = store.settings.maxFileCeilingBytes;
+                    await saveStore(ctx.sessionId, store);
+                    const stillTruncated =
+                        fileInfo?.status === "ok" &&
+                        fileInfo.size > store.settings.maxFileCeilingBytes;
+                    await session.log(
+                        `Raised pin ${index + 1}'s file limit to ${formatBytes(store.settings.maxFileCeilingBytes)}` +
+                            (stillTruncated ? "; the file is larger and remains truncated." : "."),
+                        { level: "info" },
+                    );
+                } else {
+                    delete selected.maxFileBytes;
+                    await saveStore(ctx.sessionId, store);
+                    await session.log(
+                        `Restored pin ${index + 1}'s default file limit (${formatBytes(store.settings.maxFileBytes)}).`,
+                        { level: "info" },
+                    );
+                }
+                break;
+            }
             if (action === toggleLabel) {
                 selected.enabled = !isEnabled(selected);
                 await saveStore(ctx.sessionId, store);
@@ -906,7 +1073,7 @@ async function openPinboard(ctx) {
                     { level: "info" },
                 );
                 // Return to the list so the change is immediately visible (the
-                // pin's ●/○ marker updates).
+                // pin's ✓/• marker updates).
                 break;
             }
             if (action.includes("Edit")) {
@@ -930,10 +1097,10 @@ async function listPins(ctx) {
         });
         return;
     }
-    const { labels, totalBytes, unreadable } = await buildLabeledPins(store, ctx.sessionId);
+    const { labels, totalBytes, unreadable, truncated } = await buildLabeledPins(store, ctx.sessionId);
     const lines = labels.map((label) => `  ${label}`);
     await session.log(
-        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(totalBytes, unreadable)}`,
+        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(totalBytes, unreadable, truncated)}`,
         { level: "info" },
     );
 }
@@ -1026,9 +1193,8 @@ async function clearPins(ctx) {
             return;
         }
     }
-    const count = store.pins.length;
-    store.pins = [];
-    await saveStore(ctx.sessionId, store);
+    const pinIds = store.pins.map((pin) => pin.id);
+    const count = await clearPinsById(ctx.sessionId, store, pinIds);
     await session.log(`Cleared ${count} pin${count === 1 ? "" : "s"}.`, { level: "info" });
 }
 
@@ -1121,20 +1287,20 @@ async function renderPinnedContext(sessionId) {
         }
 
         const absolutePath = resolveFilePin(pin, sessionId);
+        const cap = effectiveFileLimit(store, pin);
         // Read from the resolved absolute path, but expose only the stored/display
         // path in the wrapper attribute: relative for session-rooted pins, absolute
         // for files outside the session. This avoids leaking the user's home
         // directory / username into every model prompt for session-rooted files.
         const displayPath = toStoredPath(absolutePath, sessionId);
         try {
-            // Read at most MAX_PINNED_FILE_BYTES + 1 bytes so a huge pinned file
+            // Read at most the effective limit + 1 byte so a huge pinned file
             // never loads fully into memory, and truncate on a real byte boundary
             // (slicing a JS string would count UTF-16 units, not UTF-8 bytes).
             const handle = await open(absolutePath, "r");
             let buffer;
             let overCap;
             try {
-                const cap = MAX_PINNED_FILE_BYTES;
                 buffer = Buffer.alloc(cap + 1);
                 const { bytesRead } = await handle.read(buffer, 0, cap + 1, 0);
                 overCap = bytesRead > cap;
@@ -1145,7 +1311,7 @@ async function renderPinnedContext(sessionId) {
             let contents = buffer.toString("utf8");
             let truncatedAttr = "";
             if (overCap) {
-                contents = `${contents}\n…[truncated: file exceeds ${MAX_PINNED_FILE_BYTES} bytes]`;
+                contents = `${contents}\n…[truncated: file exceeds ${cap} bytes]`;
                 truncatedAttr = " truncated=\"true\"";
             }
             // Escape so file contents (or pinned text) containing `<`, `&`, or a
@@ -1198,27 +1364,24 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (up to the first 64 KB is injected; larger files are truncated). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. This tool pins a file that ALREADY EXISTS on disk: if you need to create the file first, create it in a separate, earlier step and let that tool call finish, THEN call pin_file in a later step — do NOT issue the file-creating tool call and pin_file together in the same batch of tool calls, or pin_file may run before the file has been written. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
+            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (the session limit defaults to 128 KB; larger files are visibly truncated, and the user can raise an individual pin to the configured ceiling from /pin). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. The path may not exist yet: a missing file is pinned optimistically, shown as \"(not found)\", and injects nothing until it exists. If you need to create the file, create it in a separate earlier step and let that tool call finish before calling pin_file; do not batch creation and pinning. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
         parameters: {
             type: "object",
             properties: {
                 path: {
                     type: "string",
                     description:
-                        "Path to the file to pin; the file must already exist (create it in a separate earlier step, not in the same batch as this call). Relative paths resolve against the session's files folder — pass just the file name (e.g. `notes.txt`, not `files/notes.txt`); use an absolute path for files outside it.",
+                        "Path to the file to pin. A missing path is accepted optimistically and begins injecting once the file exists; create it in a separate earlier step rather than batching creation with this call. Relative paths resolve against the session's files folder — pass just the file name (e.g. `notes.txt`, not `files/notes.txt`); use an absolute path for files outside it. One optional leading @ is treated as pin syntax; use @@name to pin a filename that actually begins with @.",
                 },
             },
         },
         handler: async (args, invocation) => {
-            // The model may pass the path with or without a leading @ (the @ is
-            // user-facing pin syntax, not part of the filename). Strip any leading
-            // @ so buildPin receives exactly one and doesn't stat a bogus "@foo".
-            const path = String(
+            // Accept the same optional leading-@ syntax as /pin. cleanPathArgument
+            // removes exactly one @, so @@name still addresses a real filename whose
+            // first character is @ instead of silently changing it to "name".
+            const path = cleanPathArgument(String(
                 args?.path ?? args?.file ?? args?.filepath ?? args?.filename ?? "",
-            )
-                .trim()
-                .replace(/^@+/, "")
-                .trim();
+            ));
             if (!path) {
                 return "No file path was provided. Pass the file path in the 'path' argument.";
             }
@@ -1241,14 +1404,10 @@ const tools = [
             // Surface the file size so the user sees the per-turn context cost before
             // approving; a pinned file's full contents are re-injected every prompt.
             let sizeNote = "";
-            if (result.missing) {
+            if (result.fileInfo.status === "missing") {
                 sizeNote = " (file not found yet — it will be read into context once it exists)";
-            } else {
-                try {
-                    sizeNote = ` (${formatBytes((await stat(target)).size)}, re-read into context every prompt until unpinned)`;
-                } catch {
-                    // Non-fatal: if the size can't be read now, just omit the note.
-                }
+            } else if (result.fileInfo.status === "ok") {
+                sizeNote = ` (${formatBytes(result.fileInfo.size)}, re-read into context every prompt until unpinned)`;
             }
             const gate = await confirmModelAction(
                 `Allow Copilot to pin this file${sizeNote}?\n${target}`,
@@ -1263,7 +1422,7 @@ const tools = [
                 // creates it (in a separate step) rather than assuming the pin failed.
                 return `${status.message} The file doesn't exist yet, so it shows as "(not found)" and nothing is injected until it exists — create it in a separate step if you haven't already.`;
             }
-            return status.message;
+            return pinResultMessage(invocation.sessionId, result, status);
         },
     },
     {
@@ -1315,27 +1474,25 @@ const tools = [
             if (store.pins.length === 0) {
                 return "No pins are set for this session.";
             }
+            const summary = await summarizePins(store, invocation.sessionId);
             const lines = [];
-            let activeBytes = 0;
-            for (let index = 0; index < store.pins.length; index++) {
-                const pin = store.pins[index];
-                const head = `${index + 1}. (${isEnabled(pin) ? "enabled" : "disabled"})`;
+            for (const item of summary.items) {
+                const { pin, index } = item;
+                const head = `${index + 1}. (${item.enabled ? "enabled" : "disabled"})`;
                 // Redact the content/path of disabled pins: the user silenced them,
                 // so an ungated model-callable tool must not become an exfiltration
                 // path for their contents. Disabled pins add nothing to prompts.
-                if (!isEnabled(pin)) {
+                if (!item.enabled) {
                     lines.push(`${head} [content hidden — pin is disabled]`);
                     continue;
                 }
-                const bytes = await pinBytes(pin, invocation.sessionId);
-                activeBytes += bytes;
-                // Show the per-turn cost for file pins (prompt pins are tiny); the
-                // total below covers everything injected.
-                const cost = pin.type === "file" ? ` (~${formatBytes(bytes)})` : "";
-                lines.push(`${head} ${pinDescriptor(pin, invocation.sessionId)}${cost}`);
+                const suffix = pin.type === "file" ? fileSummarySuffix(item) : "";
+                lines.push(`${head} ${pinDescriptor(pin, invocation.sessionId)}${suffix}`);
             }
-            let footer = `\n≈ ${formatBytes(activeBytes)} (~${approxTokens(activeBytes)} tokens) added to every prompt.`;
-            if (activeBytes > SOFT_PIN_BUDGET_BYTES) {
+            let footer =
+                `\n${pinTotalSummary(summary.totalBytes, summary.unreadable, summary.truncated)}` +
+                ` (~${approxTokens(summary.totalBytes)} tokens).`;
+            if (summary.totalBytes > SOFT_PIN_BUDGET_BYTES) {
                 footer += ` That's a lot of context — consider unpinning or disabling large pins.`;
             }
             return lines.join("\n") + footer;
@@ -1412,8 +1569,11 @@ const tools = [
                 return gate.message;
             }
 
-            const [removed] = store.pins.splice(index, 1);
-            await saveStore(invocation.sessionId, store);
+            const result = await removePinById(invocation.sessionId, store, victim.id);
+            if (!result) {
+                return "That pin was already removed while confirmation was open.";
+            }
+            const { removed } = result;
             // Don't echo a disabled pin's content back to the model — disabled pins
             // are content-redacted elsewhere (pin_list), so report by number only.
             if (!isEnabled(removed)) {
@@ -1431,7 +1591,8 @@ const tools = [
         parameters: { type: "object", properties: {} },
         handler: async (_args, invocation) => {
             const store = await loadStore(invocation.sessionId);
-            const count = store.pins.length;
+            const pinIds = store.pins.map((pin) => pin.id);
+            const count = pinIds.length;
             if (count === 0) {
                 return "No pins to clear.";
             }
@@ -1444,9 +1605,8 @@ const tools = [
             if (!gate.ok) {
                 return gate.message;
             }
-            store.pins = [];
-            await saveStore(invocation.sessionId, store);
-            return `Cleared ${count} pin${count === 1 ? "" : "s"}.`;
+            const removed = await clearPinsById(invocation.sessionId, store, pinIds);
+            return `Cleared ${removed} pin${removed === 1 ? "" : "s"}.`;
         },
     },
 ];
@@ -1484,16 +1644,13 @@ session = await joinSession({
 try {
     const startupStore = await loadStore(session.sessionId);
     if (startupStore.pins.length > 0) {
-        const active = startupStore.pins.filter(isEnabled);
+        const summary = await summarizePins(startupStore, session.sessionId);
+        const active = summary.items.filter((item) => item.enabled);
         const disabled = startupStore.pins.length - active.length;
-        let activeBytes = 0;
-        for (const pin of active) {
-            activeBytes += await pinBytes(pin, session.sessionId);
-        }
         await session.log(
             `session-pins: ${active.length} pin${active.length === 1 ? "" : "s"} active` +
                 (disabled ? ` (${disabled} disabled)` : "") +
-                `, ≈ ${formatBytes(activeBytes)} added to every prompt — use /pin to view or manage.`,
+                `, ${pinTotalSummary(summary.totalBytes, summary.unreadable, summary.truncated)} — use /pin to view or manage.`,
             { level: "info" },
         );
     }
