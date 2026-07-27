@@ -659,21 +659,29 @@ async function pinBytes(pin, sessionId) {
     }
 }
 
-// Does a file pin's target currently exist on disk as a readable file? Used to flag
-// "(not found)" in the pinboard / list for a pin whose file is missing — either a
-// not-yet-created file (pinned optimistically to avoid the create/pin race) or a
-// stale pin whose file was moved/deleted. Best-effort: any error counts as missing.
-// Read status + size of a file pin's target in a single stat. status is "ok" (a
-// readable regular file), "missing" (ENOENT — not created yet, or moved/deleted),
-// or "unreadable" (exists but can't be read as a file: a directory, a permissions
-// error, etc.). size is the raw byte size (only meaningful when status is "ok"),
-// used to show the injected size and flag truncation in the pinboard / list.
+// Read status + size of a file pin's target the SAME way renderPinnedContext does
+// — by opening it — so the pinboard/list never disagree with what's actually
+// injected. status is "ok" (a regular file that can be opened for reading),
+// "missing" (ENOENT — not created yet, or moved/deleted), or "unreadable" (exists
+// but can't be opened/read as a file: a directory (EISDIR), a permissions error
+// (EACCES), etc.). Using stat() alone would be wrong here: stat succeeds on a
+// chmod-000 file, so the pinboard would show a size and skip the "can't be read"
+// count while render silently injected nothing. size is the byte size (meaningful
+// only when status is "ok"), used to show the injected size and flag truncation.
 async function filePinInfo(pin, sessionId) {
+    let handle;
     try {
-        const info = await stat(resolveFilePin(pin, sessionId));
-        return info.isFile() ? { status: "ok", size: info.size } : { status: "unreadable", size: 0 };
+        handle = await open(resolveFilePin(pin, sessionId), "r");
     } catch (error) {
         return { status: error?.code === "ENOENT" ? "missing" : "unreadable", size: 0 };
+    }
+    try {
+        const info = await handle.stat();
+        return info.isFile() ? { status: "ok", size: info.size } : { status: "unreadable", size: 0 };
+    } catch {
+        return { status: "unreadable", size: 0 };
+    } finally {
+        await handle.close();
     }
 }
 
