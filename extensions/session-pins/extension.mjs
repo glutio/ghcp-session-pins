@@ -646,17 +646,15 @@ function approxTokens(bytes) {
 
 // Approximate bytes a pin adds to each prompt: the prompt text, or the file's
 // on-disk size capped at the injection cap (larger files are truncated on inject).
-// Best-effort — an unreadable file counts as 0.
+// A file that can't actually be read (missing, directory, permissions) counts as 0,
+// using the SAME open()-based check as renderPinnedContext (via filePinInfo), so the
+// byte estimate never over-counts a stat-able-but-unreadable file the prompt skips.
 async function pinBytes(pin, sessionId) {
     if (pin.type === "prompt") {
         return Buffer.byteLength(String(pin.text ?? ""), "utf8");
     }
-    try {
-        const { size } = await stat(resolveFilePin(pin, sessionId));
-        return Math.min(size, MAX_PINNED_FILE_BYTES);
-    } catch {
-        return 0;
-    }
+    const { status, size } = await filePinInfo(pin, sessionId);
+    return status === "ok" ? Math.min(size, MAX_PINNED_FILE_BYTES) : 0;
 }
 
 // Read status + size of a file pin's target the SAME way renderPinnedContext does
