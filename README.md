@@ -89,7 +89,7 @@ When you ask in plain language, Copilot manages pins through a small set of tool
 | `pin_remove` | Remove one pin by number or text/path match | Asks before removing |
 | `pin_clear` | Remove all pins | Asks before clearing |
 
-Every pin-changing tool is **model-initiated**, so each one asks you to confirm first (see *Safety* below). Only your own `/pin` commands change pins without a prompt. When Copilot needs to *create* a file and pin it, it writes the file into the session files folder in one step, then pins it in a later step.
+Every pin-changing tool is **model-initiated**, so each one asks you to confirm first (see *Safety* below). Only your own `/pin` commands bypass this model-consent gate — though the interactive pinboard still shows an ordinary confirmation for destructive actions like delete and clear. When Copilot needs to *create* a file and pin it, it writes the file into the session files folder in one step, then pins it in a later step.
 
 ### A worked example
 
@@ -112,7 +112,7 @@ Every pin-changing tool is **model-initiated**, so each one asks you to confirm 
 Session Pins is designed to never break your prompt, even on bad input:
 
 - **A pinned file that doesn't exist yet** — pinning still succeeds (so a *create-then-pin* request never races), the pin shows as `(not found)` in the pinboard and `/pin list`, and **nothing is injected** until the file exists. Once it does, its contents appear on the next prompt automatically.
-- **A file that exists but can't be read** (e.g. a directory, or a permissions error) — a compact `could not be read (error code …)` notice is injected in its place. Only the error *code* is shown; the absolute path is never leaked.
+- **A file that exists but can't be read** (e.g. a directory, or a permissions error) — a compact `could not be read (error code …)` notice is injected in its place. Only the error *code* is shown (never the raw OS error message), and a session-rooted file's absolute path is never leaked — a file you pinned by an explicit absolute path outside the session still shows that path, since you supplied it.
 - **A file larger than 64 KB** — only the first 64 KB is injected, followed by a `…[truncated: file exceeds 65536 bytes]` marker, and the `<live_file_pin>` wrapper is tagged `truncated="true"`. Pin large files sparingly: the injected bytes are added to **every** prompt.
 - **A corrupt or partially-invalid `pins.json`** — malformed entries are dropped on load (with a logged warning) and the valid pins still load; the prompt hook never throws.
 - **A relative path containing `..`** — rejected. Relative pins are rooted at the session files folder; to pin a file outside the session, pass an absolute path.
