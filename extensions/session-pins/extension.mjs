@@ -407,33 +407,54 @@ function pinLabel(pin, index, sessionId) {
 // pins are silenced, so they add nothing to the total and get no cost suffix.
 async function buildLabeledPins(store, sessionId) {
     let totalBytes = 0;
+    // Count of ENABLED file pins whose content can't be read (missing OR
+    // inaccessible) — surfaced as a single number in the summary line. Such a pin
+    // silently contributes nothing to the prompt, so the count warns the user.
+    let unreadable = 0;
     const labels = [];
     for (let index = 0; index < store.pins.length; index++) {
         const pin = store.pins[index];
         let suffix = "";
         if (pin.type === "file") {
-            // A missing file (not yet created, or moved/deleted) is flagged so a
-            // typo or a never-created optimistic pin is visible — shown whether the
-            // pin is enabled or not, since it's a status signal, not file content.
-            if (!(await filePinExists(pin, sessionId))) {
-                suffix = " (not found)";
+            // A file pin's status is flagged so a typo, a never-created optimistic
+            // pin, or a moved/deleted/locked file is visible — shown whether the pin
+            // is enabled or not, since it's a status signal, not file content.
+            // "(not found)" = missing; "(read error)" = exists but couldn't be read
+            // (a directory, permissions error, etc.).
+            const { status, size } = await filePinInfo(pin, sessionId);
+            if (status === "missing" || status === "unreadable") {
+                suffix = status === "missing" ? " (not found)" : " (read error)";
+                if (isEnabled(pin)) {
+                    unreadable++;
+                }
             } else if (isEnabled(pin)) {
-                const bytes = await pinBytes(pin, sessionId);
-                totalBytes += bytes;
-                suffix = ` (~${formatBytes(bytes)})`;
+                // A file over the cap is injected only up to MAX_PINNED_FILE_BYTES, so
+                // count the capped bytes in the total and flag the truncation with the
+                // real size + the cap (e.g. "(~150 KB, truncated to 64 KB)").
+                const injected = Math.min(size, MAX_PINNED_FILE_BYTES);
+                totalBytes += injected;
+                suffix = size > MAX_PINNED_FILE_BYTES
+                    ? ` (~${formatBytes(size)}, truncated to ${formatBytes(MAX_PINNED_FILE_BYTES)})`
+                    : ` (~${formatBytes(injected)})`;
             }
         } else if (isEnabled(pin)) {
             totalBytes += await pinBytes(pin, sessionId);
         }
         labels.push(pinLabel(pin, index, sessionId) + suffix);
     }
-    return { labels, totalBytes };
+    return { labels, totalBytes, unreadable };
 }
 
 // One-line running-total summary shown in the pinboard title and the /pin list
 // footer. Bytes only — an exact figure, rather than a fake-precise token estimate.
-function pinTotalSummary(totalBytes) {
-    return `\u2248 ${formatBytes(totalBytes)} added to every prompt`;
+// Appends a count of enabled pins that can't be read (missing or read error), so
+// the user notices silently-dropped context; no need to split the two kinds here —
+// the per-pin labels already distinguish "(not found)" vs "(read error)".
+function pinTotalSummary(totalBytes, unreadable = 0) {
+    const base = `\u2248 ${formatBytes(totalBytes)} added to every prompt`;
+    return unreadable > 0
+        ? `${base} \u00b7 ${unreadable} pin${unreadable === 1 ? "" : "s"} can't be read`
+        : base;
 }
 
 function cleanPathArgument(raw) {
@@ -642,11 +663,17 @@ async function pinBytes(pin, sessionId) {
 // "(not found)" in the pinboard / list for a pin whose file is missing — either a
 // not-yet-created file (pinned optimistically to avoid the create/pin race) or a
 // stale pin whose file was moved/deleted. Best-effort: any error counts as missing.
-async function filePinExists(pin, sessionId) {
+// Read status + size of a file pin's target in a single stat. status is "ok" (a
+// readable regular file), "missing" (ENOENT — not created yet, or moved/deleted),
+// or "unreadable" (exists but can't be read as a file: a directory, a permissions
+// error, etc.). size is the raw byte size (only meaningful when status is "ok"),
+// used to show the injected size and flag truncation in the pinboard / list.
+async function filePinInfo(pin, sessionId) {
     try {
-        return (await stat(resolveFilePin(pin, sessionId))).isFile();
-    } catch {
-        return false;
+        const info = await stat(resolveFilePin(pin, sessionId));
+        return info.isFile() ? { status: "ok", size: info.size } : { status: "unreadable", size: 0 };
+    } catch (error) {
+        return { status: error?.code === "ENOENT" ? "missing" : "unreadable", size: 0 };
     }
 }
 
@@ -811,9 +838,9 @@ async function openPinboard(ctx) {
 
     while (true) {
         const store = await loadStore(ctx.sessionId);
-        const { labels: pinItems, totalBytes } = await buildLabeledPins(store, ctx.sessionId);
+        const { labels: pinItems, totalBytes, unreadable } = await buildLabeledPins(store, ctx.sessionId);
         const title = store.pins.length
-            ? `Session pins — ${pinTotalSummary(totalBytes)}`
+            ? `Session pins — ${pinTotalSummary(totalBytes, unreadable)}`
             : "No pins yet";
         const choice = await choose(title, [...pinItems, ADD]);
 
@@ -897,10 +924,10 @@ async function listPins(ctx) {
         });
         return;
     }
-    const { labels, totalBytes } = await buildLabeledPins(store, ctx.sessionId);
+    const { labels, totalBytes, unreadable } = await buildLabeledPins(store, ctx.sessionId);
     const lines = labels.map((label) => `  ${label}`);
     await session.log(
-        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(totalBytes)}`,
+        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(totalBytes, unreadable)}`,
         { level: "info" },
     );
 }
@@ -1120,24 +1147,15 @@ async function renderPinnedContext(sessionId) {
             sections.push(
                 `<live_file_pin number="${number}" path="${escapeXmlAttr(displayPath)}"${truncatedAttr}>\n${escapeXml(contents)}\n</live_file_pin>`,
             );
-        } catch (error) {
-            // A missing file (ENOENT) is expected for an optimistically-pinned file
-            // that hasn't been created yet (or was moved/deleted): inject NOTHING so
-            // we don't spam every prompt with an unreadable block. The pinboard and
-            // /pin list already flag it as "(not found)". Any OTHER fs error (e.g.
-            // EACCES — the file exists but can't be read) is a genuine problem, so
-            // surface a compact notice. Report only the error code (never
-            // error.message, which embeds the absolute path and would leak the home
-            // dir/username; the path attribute already avoids this).
-            if (error?.code === "ENOENT") {
-                continue;
-            }
-            const reason = fsErrorReason(error);
-            sections.push(
-                `<live_file_pin number="${number}" path="${escapeXmlAttr(displayPath)}" unreadable="true">\n` +
-                    `The pinned file could not be read (${escapeXml(reason)}).\n` +
-                    `</live_file_pin>`,
-            );
+        } catch {
+            // A pinned file we can't read right now — missing (ENOENT), a directory
+            // (EISDIR), a permissions error (EACCES), etc. — injects NOTHING rather
+            // than spamming every prompt with an error notice the model can't act on.
+            // The pinboard and /pin list surface the pin's status to the user (e.g.
+            // "(not found)"); the model prompt only ever contains pin content that was
+            // actually read. Also avoids ever emitting an fs error message, which can
+            // embed the absolute path / home dir.
+            continue;
         }
     }
 

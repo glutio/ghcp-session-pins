@@ -194,16 +194,15 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     const ampName = "a & b.md";
     writeFileSync(join(state.sessionRoot, "files", ampName), 'content with <tag> & "quote"');
     // A pin whose target exists but ISN'T a readable regular file (a directory ->
-    // EISDIR) exercises the render catch branch's compact "unreadable" notice. (A
-    // merely MISSING file is ENOENT and is now injected as nothing — covered
-    // separately below — so a directory is used here to reach the unreadable path.)
+    // EISDIR) must inject NOTHING — like a missing file — rather than an error
+    // notice. The pinboard/list surface the status to the user instead.
     mkdirSync(join(state.sessionRoot, "files", "adir"));
     const pinsJson = {
         version: 1,
         pins: [
             { id: "p1", type: "prompt", text: "valid prompt <b>&</b>" },
             { id: "f1", type: "file", path: ampName },
-            { id: "f2", type: "file", path: "adir" },  // directory -> unreadable (EISDIR)
+            { id: "f2", type: "file", path: "adir" },  // directory -> unreadable -> nothing injected
             { id: "bad1", type: "file", path: 123 },   // non-string path -> drop
             { id: "bad2", type: "file" },              // no path -> drop
             { type: "prompt", text: "no id" },         // no id -> drop
@@ -225,13 +224,12 @@ group("XML escaping + malformed-pin handling (prompt hook)");
     check("readable file content is rendered", out.includes("content with"));
     check("file content angle brackets escaped", out.includes("&lt;tag&gt;"));
     check("'&' in path attribute is escaped", out.includes("a &amp; b.md"));
-    // (Path attributes containing " ' < > can't be produced on Windows: any such
-    // path fails to stat and — for a missing file — now injects nothing, so those
-    // cases are unreachable through render here. escapeXmlAttr still handles them.)
-    check("a non-readable (directory) file pin renders an unreadable notice", /unreadable="true"/.test(out) && out.includes("could not be read"));
-    check("unreadable notice emits an error code, not a message", /could not be read \(error code \w+\)/.test(out));
+    // A pinned file that can't be read (here a directory) injects nothing — no
+    // notice, no error string, no wrapper for it.
+    check("an unreadable (directory) file pin injects nothing", !/unreadable/.test(out) && !/could not be read/.test(out));
+    check("the unreadable pin's path is not injected at all", !/adir/.test(out));
     check("exactly one prompt-pin survives", (out.match(/<prompt_pin /g) || []).length === 1);
-    check("exactly two file-pins survive", (out.match(/<live_file_pin /g) || []).length === 2);
+    check("only the readable file-pin is injected", (out.match(/<live_file_pin /g) || []).length === 1);
     check("injected pins are numbered, not guid-identified", /<prompt_pin number="\d+">/.test(out) && !/ id=/.test(out));
     check("dropped-pins warning is logged", state.logs.some((m) => /dropped 7 malformed/.test(m)));
     // Session-rooted pins must expose only their relative/display path — never the
@@ -404,21 +402,37 @@ group("Enable / disable pins");
     check("/pin list shows a per-file size on file pins", /@big\.md \(~/.test(costLog));
     check("/pin list does not add a size to prompt pins", /"a rule"(?! \(~)/.test(costLog));
 
-    // /pin list flags a file pin whose file doesn't exist (optimistic pin, or a
-    // moved/deleted file) as "(not found)" instead of a size, and it is excluded
-    // from the running byte total.
+    // A file pin over the 64 KB cap is flagged as truncated (with the real size and
+    // the cap) in /pin list, and only the capped bytes count toward the total.
+    freshSession();
+    writeFileSync(join(state.sessionRoot, "files", "huge.md"), "x".repeat(100 * 1024));
+    seedPins([{ id: "f1", type: "file", path: "huge.md", enabled: true }]);
+    state.logs.length = 0;
+    await runPin({ args: "list", sessionId: inv.sessionId });
+    const truncLog = state.logs.join("\n");
+    check("/pin list flags an over-cap file as truncated to the cap", /@huge\.md \(~100 KB, truncated to 64 KB\)/.test(truncLog));
+    check("/pin list total counts only the injected 64 KB", /64 KB added to every prompt/.test(truncLog));
+
+    // /pin list flags file pins that can't be read: a missing file as "(not found)"
+    // and an existing-but-unreadable one (a directory) as "(read error)". Both are
+    // excluded from the byte total, and the summary counts how many can't be read.
     freshSession();
     writeFileSync(join(state.sessionRoot, "files", "here.md"), "x".repeat(2048));
+    mkdirSync(join(state.sessionRoot, "files", "adir"));
     seedPins([
         { id: "f1", type: "file", path: "here.md", enabled: true },
-        { id: "f2", type: "file", path: "gone.md", enabled: true },   // never created
+        { id: "f2", type: "file", path: "gone.md", enabled: true },   // never created -> missing
+        { id: "f3", type: "file", path: "adir", enabled: true },      // directory -> read error
     ]);
     state.logs.length = 0;
     await runPin({ args: "list", sessionId: inv.sessionId });
     const missLog = state.logs.join("\n");
     check("/pin list flags a missing file pin as (not found)", /@gone\.md \(not found\)/.test(missLog));
+    check("/pin list flags an unreadable file pin as (read error)", /@adir \(read error\)/.test(missLog));
+    check("/pin list never injects an error string, only labels the pin", !/could not be read/.test(missLog));
     check("/pin list still sizes the present file pin", /@here\.md \(~/.test(missLog));
     check("/pin list total counts only the present file (~2 KB)", /2 KB added to every prompt/.test(missLog));
+    check("/pin list summary counts pins that can't be read", /2 pins can't be read/.test(missLog));
 
     // Pinboard toggle: pick the pin, choose Disable -> persisted + no longer
     // injected, and the dialog returns to the list so the change is visible.
