@@ -352,12 +352,17 @@ async function saveStore(sessionId, store) {
 
 function shortText(text, maxLength = PREVIEW_LENGTH) {
     const oneLine = text.replace(/\s+/g, " ").trim();
+    if (oneLine.length <= maxLength) {
+        return oneLine;
+    }
     // Use an ASCII "..." rather than a Unicode ellipsis (U+2026): the ellipsis has
     // East-Asian "Ambiguous" width, so the host picker's width/wrap calculation can
     // miscount it and render a spurious blank line after a truncated option. ASCII
     // dots are unambiguously width-1 everywhere.
-    return oneLine.length <= maxLength
-        ? oneLine
+    // When maxLength is too small to fit the "..." (<= 3), hard-slice instead so the
+    // output length always stays bounded by maxLength.
+    return maxLength <= 3
+        ? oneLine.slice(0, Math.max(0, maxLength))
         : `${oneLine.slice(0, maxLength - 3)}...`;
 }
 

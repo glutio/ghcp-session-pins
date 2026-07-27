@@ -84,7 +84,7 @@ When you ask in plain language, Copilot manages pins through a small set of tool
 | Tool | What it does | Confirmation |
 |------|--------------|--------------|
 | `pin_prompt` | Pin an instruction | Asks before pinning |
-| `pin_file` | Pin an existing file (relative paths resolve against the session files folder) | Asks before pinning |
+| `pin_file` | Pin a file — relative paths resolve against the session files folder; a not-yet-created file is pinned optimistically and shown `(not found)` until it exists (so a *create-then-pin* request never races) | Asks before pinning |
 | `pin_list` | List current pins with their numbers, state, and per-pin/total context cost | None (read-only) |
 | `pin_remove` | Remove one pin by number or text/path match | Asks before removing |
 | `pin_clear` | Remove all pins | Asks before clearing |
@@ -113,7 +113,7 @@ Session Pins is designed to never break your prompt, even on bad input:
 
 - **A pinned file that doesn't exist yet** — pinning still succeeds (so a *create-then-pin* request never races), the pin shows as `(not found)` in the pinboard and `/pin list`, and **nothing is injected** until the file exists. Once it does, its contents appear on the next prompt automatically.
 - **A file that exists but can't be read** (e.g. a directory, or a permissions error) — a compact `could not be read (error code …)` notice is injected in its place. Only the error *code* is shown; the absolute path is never leaked.
-- **A file larger than 64 KB** — only the first 64 KB is injected, followed by a `…[truncated]` marker. Pin large files sparingly: the injected bytes are added to **every** prompt.
+- **A file larger than 64 KB** — only the first 64 KB is injected, followed by a `…[truncated: file exceeds 65536 bytes]` marker, and the `<live_file_pin>` wrapper is tagged `truncated="true"`. Pin large files sparingly: the injected bytes are added to **every** prompt.
 - **A corrupt or partially-invalid `pins.json`** — malformed entries are dropped on load (with a logged warning) and the valid pins still load; the prompt hook never throws.
 - **A relative path containing `..`** — rejected. Relative pins are rooted at the session files folder; to pin a file outside the session, pass an absolute path.
 - **Experimental mode not enabled** — the extension doesn't load at all, so the `/pin` command and pin tools simply won't be present. Launch with `copilot --experimental` (see *Install*).
@@ -122,7 +122,7 @@ Session Pins is designed to never break your prompt, even on bad input:
 
 Pinned content is re-injected into every prompt, so treat it with the same care as any always-on context:
 
-- **Pinned file contents are data, not instructions.** They're injected inside a labeled `<live_file_pin>` wrapper (prompt pins inside `<prompt_pin>`), and XML metacharacters in file contents are escaped so a file can't "break out" of its wrapper. Copilot should treat text *inside* a pinned file as data to consider — not as commands to obey — which limits prompt-injection from pinned documents.
+- **Only pin content you trust.** Pins are injected inside labeled `<prompt_pin>` / `<live_file_pin>` wrappers, and XML metacharacters in file contents are escaped, so a pinned file can't structurally "break out" of its block. That containment is structural only — the injected pin block is introduced to the model as active instructions for the turn (that's the whole point of a pin), so pinning a file is equivalent to pasting its contents into your own prompt every turn. Don't pin documents whose contents you wouldn't type yourself, since instructions *inside* an untrusted pinned file can influence the model.
 - **Model-initiated pin changes require your consent.** Because the pin tools are callable by the model, a prompt-injection (from a file, tool result, or web page) could try to pin, unpin, or clear on your behalf. Every model-initiated `pin_*` change asks for explicit confirmation and is **refused outright** when no confirmation UI is available. Only your direct `/pin` commands bypass this gate.
 - **Don't pin secrets.** A pinned file is re-read into every prompt and sent to the model each turn — avoid pinning `.env` files, key material, tokens, or other sensitive files. The pinboard and `/pin list` show each pin's byte size and a running total so you can see exactly how much (and, by inspection, what) is being injected.
 - **Disabled pins are redacted.** A disabled pin's content is not injected and is not echoed back to the model, so silencing a pin also hides its contents.
