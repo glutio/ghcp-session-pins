@@ -1,16 +1,16 @@
 // Copilot CLI extension: session-pins
-// A single `/pin` command (MCP-style subcommands) that manages editable prompt
-// pins and live file pins for the current Copilot session. Pinned context is
+// A single `/pin` command (MCP-style subcommands) that manages editable instruction
+// pins and file pins for the current Copilot session. Pinned context is
 // injected into every prompt.
 //
 // Usage:
-//   /pin                  Open the interactive pinboard (browse / add / edit / enable-disable / delete).
+//   /pin                  Open the interactive pinboard (browse / add / edit / enable-disable / remove).
 //   /pin add <text>       Pin an editable instruction.
-//   /pin add @<path>      Pin a live file (reread from disk every prompt).
+//   /pin add @<path>      Pin a file (reread from disk every prompt).
 //   /pin list             List pins with their numbers.
 //   /pin edit [n]         Edit a pin in place.
-//   /pin remove [n]       Delete a pin.
-//   /pin clear            Delete all pins.
+//   /pin remove [n]       Remove a pin.
+//   /pin clear            Remove all pins.
 //
 // Pins live inside the session folder — session.workspacePath when available,
 // otherwise <COPILOT_HOME, or ~/.copilot>/session-state/<id> — so they travel with
@@ -37,6 +37,10 @@ const storeLoads = new Map();
 // serialized — otherwise their rename() calls can land out of order and an older
 // snapshot could overwrite a newer one (last-writer-wins data loss).
 const saveQueues = new Map();
+// Capture the directory where Copilot CLI started. Relative paths selected by the
+// CLI's native @ autocomplete are rooted here, and storing the resolved path
+// absolutely keeps the pin stable even if a later tool changes process.cwd().
+const WORKING_DIRECTORY = process.cwd();
 
 // Max characters shown when previewing a prompt pin's text (in the pinboard, the
 // pin_list tool, and log lines). Kept in one place so every preview truncates
@@ -169,8 +173,8 @@ function sessionDir(sessionId) {
     return session?.workspacePath ?? join(copilotHome(), "session-state", safeId(sessionId));
 }
 
-// The root for session-level user files (<session>/files). Session file pins are
-// stored relative to this, and typed relative paths resolve against it.
+// The root for session-level user files (<session>/files). Pins inside it are
+// stored relative to this directory.
 function sessionFilesDir(sessionId) {
     return join(sessionDir(sessionId), SESSION_FILES_SUBDIR);
 }
@@ -248,18 +252,13 @@ function resolveFilePin(pin, sessionId) {
     return isAbsolute(pin.path) ? pin.path : join(sessionFilesDir(sessionId), pin.path);
 }
 
-// Resolve a user/model-supplied path to absolute using the session-rooted rule:
-// a relative path is rooted at the session files folder; an absolute path is
-// used as-is.
-function resolveInputPath(rawPath, sessionId) {
-    return isAbsolute(rawPath) ? rawPath : resolve(sessionFilesDir(sessionId), rawPath);
+function isExplicitWorkingDirectoryPath(rawPath) {
+    return rawPath.startsWith("./") || rawPath.startsWith(".\\");
 }
 
-// A relative input path is contractually rooted at <session>/files, so a ".."
-// segment would let it escape that folder and be stored as an absolute pin —
-// bypassing the load-time traversal guard (which only rejects "..") in stored
-// relative paths). Reject relative traversal at input time; pinning an
-// outside-session file requires an explicit absolute path.
+// Reject relative traversal at input time. It makes the intended base ambiguous
+// and could bypass the load-time traversal guard for session-relative pins; an
+// absolute path remains available for files outside either normal root.
 function hasRelativeTraversal(rawPath) {
     return !isAbsolute(rawPath) && rawPath.split(/[\\/]/).includes("..");
 }
@@ -328,25 +327,25 @@ async function loadStore(sessionId) {
                 const dropped = parsed.pins.length - valid.length;
                 if (dropped > 0) {
                     await session.log(
-                        `session-pins: dropped ${dropped} malformed pin${dropped === 1 ? "" : "s"} from pins.json.`,
+                        `session-pins: Ignored ${dropped} malformed pin${dropped === 1 ? "" : "s"} in pins.json.`,
                         { level: "warning", ephemeral: true },
                     );
                 }
                 if (!validConfiguredLimit) {
                     await session.log(
-                        `session-pins: invalid settings.maxFileBytes in pins.json; using ${DEFAULT_MAX_PINNED_FILE_BYTES} bytes (valid range: 1-${HARD_MAX_PINNED_FILE_BYTES}).`,
+                        `session-pins: Invalid settings.maxFileBytes in pins.json; using ${formatBytes(DEFAULT_MAX_PINNED_FILE_BYTES)} (maximum: ${formatBytes(HARD_MAX_PINNED_FILE_BYTES)}).`,
                         { level: "warning", ephemeral: true },
                     );
                 }
                 if (!validConfiguredCeiling) {
                     await session.log(
-                        `session-pins: invalid settings.maxFileCeilingBytes in pins.json; using ${maxFileCeilingBytes} bytes (it must be at least maxFileBytes and no more than ${HARD_MAX_PINNED_FILE_BYTES}).`,
+                        `session-pins: Invalid settings.maxFileCeilingBytes in pins.json; using ${formatBytes(maxFileCeilingBytes)} (it must be at least maxFileBytes and no more than ${formatBytes(HARD_MAX_PINNED_FILE_BYTES)}).`,
                         { level: "warning", ephemeral: true },
                     );
                 }
                 if (invalidOverrides > 0) {
                     await session.log(
-                        `session-pins: ignored invalid maxFileBytes override on ${invalidOverrides} file pin${invalidOverrides === 1 ? "" : "s"}; using the session default.`,
+                        `session-pins: Ignored invalid maxFileBytes overrides on ${invalidOverrides} file pin${invalidOverrides === 1 ? "" : "s"}.`,
                         { level: "warning", ephemeral: true },
                     );
                 }
@@ -358,7 +357,7 @@ async function loadStore(sessionId) {
             // the bad file atomically.
             if (error?.code !== "ENOENT") {
                 await session.log(
-                    `session-pins: ignoring unreadable pin store (${error?.code ?? error?.name ?? "unknown error"}); starting empty.`,
+                    `session-pins: Could not read pins.json (${error?.code ?? error?.name ?? "unknown error"}); starting with no pins.`,
                     { level: "warning", ephemeral: true },
                 );
             }
@@ -492,6 +491,8 @@ function pinLabel(pin, index, sessionId) {
 async function summarizePins(store, sessionId) {
     let totalBytes = 0;
     let unreadable = 0;
+    let notFound = 0;
+    let readErrors = 0;
     let truncated = 0;
     const items = [];
     for (let index = 0; index < store.pins.length; index++) {
@@ -506,6 +507,11 @@ async function summarizePins(store, sessionId) {
             ({ status, size } = await filePinInfo(pin, sessionId));
             if (enabled && status !== "ok") {
                 unreadable++;
+                if (status === "missing") {
+                    notFound++;
+                } else {
+                    readErrors++;
+                }
             }
             if (enabled && status === "ok") {
                 injectedBytes = Math.min(size, limit);
@@ -528,7 +534,7 @@ async function summarizePins(store, sessionId) {
             truncated: status === "ok" && size > limit,
         });
     }
-    return { items, totalBytes, unreadable, truncated };
+    return { items, totalBytes, unreadable, notFound, readErrors, truncated };
 }
 
 function fileSummarySuffix(item) {
@@ -563,16 +569,25 @@ async function buildLabeledPins(store, sessionId) {
 // Appends a count of enabled pins that can't be read (missing or read error), so
 // the user notices silently-dropped context; no need to split the two kinds here —
 // the per-pin labels already distinguish "(not found)" vs "(read error)".
-function pinTotalSummary(totalBytes, unreadable = 0, truncated = 0) {
-    const base = `\u2248 ${formatBytes(totalBytes)} added to every prompt`;
-    const notices = [];
-    if (unreadable > 0) {
-        notices.push(`${unreadable} pin${unreadable === 1 ? "" : "s"} can't be read`);
+function pinTotalSummary(summary, active, disabled) {
+    const parts = [];
+    if (active !== undefined) {
+        parts.push(`${active} active`);
     }
-    if (truncated > 0) {
-        notices.push(`${truncated} file pin${truncated === 1 ? "" : "s"} truncated`);
+    if (disabled > 0) {
+        parts.push(`${disabled} disabled`);
     }
-    return notices.length > 0 ? `${base} \u00b7 ${notices.join(" \u00b7 ")}` : base;
+    parts.push(`~${formatBytes(summary.totalBytes)} per prompt`);
+    if (summary.notFound > 0) {
+        parts.push(`${summary.notFound} not found`);
+    }
+    if (summary.readErrors > 0) {
+        parts.push(`${summary.readErrors} read error${summary.readErrors === 1 ? "" : "s"}`);
+    }
+    if (summary.truncated > 0) {
+        parts.push(`${summary.truncated} truncated`);
+    }
+    return parts.join(" \u00b7 ");
 }
 
 function cleanPathArgument(raw) {
@@ -638,11 +653,61 @@ async function prepareFilePin(raw, sessionId) {
     if (hasRelativeTraversal(rawPath)) {
         return {
             ok: false,
-            error: "A relative pin path can't contain '..' (it's rooted at the session files folder). Pass an absolute path to pin a file outside the session.",
+            error: "A relative pin path can't contain '..'. Pass an absolute path instead.",
         };
     }
 
-    const absolutePath = resolveInputPath(rawPath, sessionId);
+    let absolutePath;
+    if (isAbsolute(rawPath)) {
+        absolutePath = rawPath;
+    } else if (isExplicitWorkingDirectoryPath(rawPath)) {
+        // @./path and @.\path always mean the CLI working directory, including
+        // optimistic pins for files that do not exist yet.
+        absolutePath = resolve(WORKING_DIRECTORY, rawPath);
+    } else {
+        const sessionPath = resolve(sessionFilesDir(sessionId), rawPath);
+        const workingPath = resolve(WORKING_DIRECTORY, rawPath);
+        const [sessionInfo, workingInfo] = await Promise.all([
+            probeFilePath(sessionPath),
+            samePath(sessionPath, workingPath)
+                ? Promise.resolve({ status: "missing", size: 0 })
+                : probeFilePath(workingPath),
+        ]);
+        const sessionExists = sessionInfo.status !== "missing";
+        const workingExists = workingInfo.status !== "missing";
+
+        if (sessionExists && workingExists) {
+            if (!elicitationEnabled()) {
+                return {
+                    ok: false,
+                    error:
+                        `Two files match ${fmtPath(`@${rawPath}`)}. ` +
+                        `Use ${fmtPath(`@./${rawPath}`)} for the working-directory file, ` +
+                        "or pass the session file's absolute path.",
+                };
+            }
+            const sessionChoice = `Session file: ${sessionPath}`;
+            const workingChoice = `Working directory: ${workingPath}`;
+            const choice = await choose(
+                `Two files match @${rawPath}. Which one should be pinned?`,
+                [sessionChoice, workingChoice],
+                "File",
+            );
+            if (choice === null) {
+                return { ok: false };
+            }
+            absolutePath = choice === sessionChoice ? sessionPath : workingPath;
+        } else if (workingExists) {
+            // Match native @ autocomplete: an existing relative cwd file should pin
+            // what the user selected, not create a same-named missing session pin.
+            absolutePath = workingPath;
+        } else {
+            // Preserve optimistic session artifacts: when no cwd file exists, a
+            // relative path belongs to <session>/files and starts injecting later.
+            absolutePath = sessionPath;
+        }
+    }
+
     const fileInfo = await probeFilePath(absolutePath);
     if (fileInfo.status === "not-file") {
         return {
@@ -711,8 +776,8 @@ async function pinResultMessage(sessionId, result, status) {
     }
     return (
         `${status.message} The file is ${formatBytes(result.fileInfo.size)}; ` +
-        `only the first ${formatBytes(limit)} will be injected. Use /pin and select it ` +
-        `to raise this pin's limit to ${formatBytes(store.settings.maxFileCeilingBytes)}.`
+        `the first ${formatBytes(limit)} will be injected. In /pin, choose ` +
+        `"Inject up to ${formatBytes(store.settings.maxFileCeilingBytes)}" to include more.`
     );
 }
 
@@ -740,7 +805,7 @@ async function addPinToStore(sessionId, pin) {
     await saveStore(sessionId, store);
     return {
         added: true,
-        message: `Pinned pin ${pinNumber}: ${pinDescriptor(pin, sessionId)}.`,
+        message: `Pinned as pin ${pinNumber}: ${pinDescriptor(pin, sessionId)}.`,
     };
 }
 
@@ -820,7 +885,7 @@ function elicitationEnabled() {
 // the body), but the `oneOf` constrains our listed options to exact values so we
 // can reliably detect and reject anything the user types into that "Other" row.
 // Returns the chosen option, or null if cancelled/declined.
-async function choose(message, options) {
+async function choose(message, options, title) {
     const result = await session.ui.elicitation({
         message,
         requestedSchema: {
@@ -828,7 +893,7 @@ async function choose(message, options) {
             properties: {
                 selection: {
                     type: "string",
-                    title: "Choose",
+                    title,
                     oneOf: options.map((option) => ({ const: option, title: option })),
                 },
             },
@@ -855,8 +920,8 @@ async function addViaDialog(ctx) {
         return;
     }
     const raw = await session.ui.input(
-        "New pin — type an instruction, or @path to pin a live file:",
-        { title: "Add a pin", minLength: 1 },
+        "What would you like to pin? Enter an instruction or an @file path.",
+        { title: "Add pin", minLength: 1 },
     );
     if (raw === null) {
         return;
@@ -873,7 +938,7 @@ async function editPin(ctx, store, index) {
 
     if (pin.type === "prompt") {
         const edited = await session.ui.input("Edit the pinned instruction:", {
-            title: "Edit prompt pin",
+            title: "Edit instruction",
             minLength: 1,
             default: pin.text,
         });
@@ -888,7 +953,7 @@ async function editPin(ctx, store, index) {
     }
 
     const editedPath = await session.ui.input("Edit the file path (@ optional):", {
-        title: "Edit live file pin",
+        title: "Edit file",
         minLength: 1,
         default: `@${pinPathDisplay(pin, ctx.sessionId)}`,
     });
@@ -916,7 +981,7 @@ async function editPin(ctx, store, index) {
 
     pin.path = prepared.storedPath;
     await saveStore(ctx.sessionId, store);
-    const note = prepared.missing ? ' (not found yet — shows as "(not found)" until the file exists)' : "";
+    const note = prepared.missing ? " (not found; it will be injected when the file exists)" : "";
     await session.log(`Updated pin ${index + 1}: ${fileDescriptor(absolutePath, ctx.sessionId)}.${note}`, { level: "info" });
 }
 
@@ -947,7 +1012,7 @@ async function deletePin(ctx, store, index) {
         return false;
     }
     if (elicitationEnabled()) {
-        const confirmed = await session.ui.confirm(`Unpin pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}?`);
+        const confirmed = await session.ui.confirm(`Remove pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}?`);
         if (!confirmed) {
             return false;
         }
@@ -957,7 +1022,7 @@ async function deletePin(ctx, store, index) {
         await session.log(`Pin ${index + 1} was already removed.`, { level: "info" });
         return false;
     }
-    await session.log(`Unpinned pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}.`, { level: "info" });
+    await session.log(`Removed pin ${index + 1}: ${pinDescriptor(pin, ctx.sessionId)}.`, { level: "info" });
     return true;
 }
 
@@ -972,11 +1037,14 @@ async function openPinboard(ctx) {
 
     while (true) {
         const store = await loadStore(ctx.sessionId);
-        const { labels: pinItems, totalBytes, unreadable, truncated } = await buildLabeledPins(store, ctx.sessionId);
+        const summary = await buildLabeledPins(store, ctx.sessionId);
+        const { labels: pinItems, items } = summary;
+        const active = items.filter((item) => item.enabled).length;
+        const disabled = items.length - active;
         const title = store.pins.length
-            ? `Session pins — ${pinTotalSummary(totalBytes, unreadable, truncated)}`
-            : "No pins yet";
-        const choice = await choose(title, [...pinItems, ADD]);
+            ? `Session pins — ${pinTotalSummary(summary, active, disabled)}`
+            : "No pins yet.";
+        const choice = await choose(title, [...pinItems, ADD], "Pin");
 
         if (choice === null) {
             return;
@@ -1017,18 +1085,18 @@ async function openPinboard(ctx) {
                     limit < store.settings.maxFileCeilingBytes
                 ) {
                     raisesLimit = true;
-                    limitAction = `Raise file limit to ${formatBytes(store.settings.maxFileCeilingBytes)}`;
+                    limitAction = `Inject up to ${formatBytes(store.settings.maxFileCeilingBytes)}`;
                 } else if (selected.maxFileBytes !== undefined) {
-                    limitAction = `Use default file limit (${formatBytes(store.settings.maxFileBytes)})`;
+                    limitAction = `Inject up to ${formatBytes(store.settings.maxFileBytes)}`;
                 }
             }
             // "Open" (file pins only) hands the file off to the agent to open in an
             // editor however it chooses; a prompt pin has no file to open.
             const options =
                 selected.type === "file"
-                    ? ["Open", "Edit", ...(limitAction ? [limitAction] : []), toggleLabel, "Delete"]
-                    : ["Edit", toggleLabel, "Delete"];
-            const action = await choose(detail, options);
+                    ? ["Open", "Edit", ...(limitAction ? [limitAction] : []), toggleLabel, "Remove"]
+                    : ["Edit", toggleLabel, "Remove"];
+            const action = await choose(detail, options, "Action");
 
             if (action === null) {
                 break;
@@ -1037,7 +1105,7 @@ async function openPinboard(ctx) {
                 const target = resolveFilePin(selected, ctx.sessionId);
                 await session.send(`Open this file in an editor: ${target}`);
                 await session.log(
-                    `Asked Copilot to open pin ${index + 1}: ${pinDescriptor(selected, ctx.sessionId)}.`,
+                    `Opening pin ${index + 1}: ${pinDescriptor(selected, ctx.sessionId)}.`,
                     { level: "info" },
                 );
                 // Close the pinboard so the agent can act on the open request.
@@ -1051,7 +1119,7 @@ async function openPinboard(ctx) {
                         fileInfo?.status === "ok" &&
                         fileInfo.size > store.settings.maxFileCeilingBytes;
                     await session.log(
-                        `Raised pin ${index + 1}'s file limit to ${formatBytes(store.settings.maxFileCeilingBytes)}` +
+                        `Pin ${index + 1} now injects up to ${formatBytes(store.settings.maxFileCeilingBytes)}` +
                             (stillTruncated ? "; the file is larger and remains truncated." : "."),
                         { level: "info" },
                     );
@@ -1059,7 +1127,7 @@ async function openPinboard(ctx) {
                     delete selected.maxFileBytes;
                     await saveStore(ctx.sessionId, store);
                     await session.log(
-                        `Restored pin ${index + 1}'s default file limit (${formatBytes(store.settings.maxFileBytes)}).`,
+                        `Pin ${index + 1} now injects up to ${formatBytes(store.settings.maxFileBytes)}.`,
                         { level: "info" },
                     );
                 }
@@ -1080,7 +1148,7 @@ async function openPinboard(ctx) {
                 await editPin(ctx, store, index);
                 continue;
             }
-            if (action.includes("Delete")) {
+            if (action.includes("Remove")) {
                 if (await deletePin(ctx, store, index)) {
                     break;
                 }
@@ -1092,15 +1160,18 @@ async function openPinboard(ctx) {
 async function listPins(ctx) {
     const store = await loadStore(ctx.sessionId);
     if (store.pins.length === 0) {
-        await session.log("No session pins. Add one with /pin add <text> or /pin add @<path>.", {
+        await session.log("No pins yet. Add one with /pin <instruction> or /pin @<path>.", {
             level: "info",
         });
         return;
     }
-    const { labels, totalBytes, unreadable, truncated } = await buildLabeledPins(store, ctx.sessionId);
+    const summary = await buildLabeledPins(store, ctx.sessionId);
+    const { labels, items } = summary;
+    const active = items.filter((item) => item.enabled).length;
+    const disabled = items.length - active;
     const lines = labels.map((label) => `  ${label}`);
     await session.log(
-        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(totalBytes, unreadable, truncated)}`,
+        `Session pins:\n${lines.join("\n")}\n\n${pinTotalSummary(summary, active, disabled)}`,
         { level: "info" },
     );
 }
@@ -1118,7 +1189,7 @@ function parseIndex(text, count) {
 // (Esc). No explicit Cancel row — Esc handles it.
 async function pickPin(store, prompt, sessionId) {
     const items = store.pins.map((pin, index) => pinLabel(pin, index, sessionId));
-    const choice = await choose(prompt, items);
+    const choice = await choose(prompt, items, "Pin");
     if (choice === null) {
         return -1;
     }
@@ -1128,7 +1199,7 @@ async function pickPin(store, prompt, sessionId) {
 async function editCommand(ctx, rest) {
     const store = await loadStore(ctx.sessionId);
     if (store.pins.length === 0) {
-        await session.log("No pins to edit.", { level: "info" });
+        await session.log("No pins yet.", { level: "info" });
         return;
     }
     // Editing always needs an interactive prompt (there is no inline edit syntax),
@@ -1159,7 +1230,7 @@ async function editCommand(ctx, rest) {
 async function removeCommand(ctx, rest) {
     const store = await loadStore(ctx.sessionId);
     if (store.pins.length === 0) {
-        await session.log("No pins to remove.", { level: "info" });
+        await session.log("No pins yet.", { level: "info" });
         return;
     }
 
@@ -1184,7 +1255,7 @@ async function removeCommand(ctx, rest) {
 async function clearPins(ctx) {
     const store = await loadStore(ctx.sessionId);
     if (store.pins.length === 0) {
-        await session.log("No pins to clear.", { level: "info" });
+        await session.log("No pins yet.", { level: "info" });
         return;
     }
     if (elicitationEnabled()) {
@@ -1201,14 +1272,15 @@ async function clearPins(ctx) {
 async function showHelp() {
     await session.log(
         [
-            "Session pins — pin instructions and live files into every prompt.",
+            "Session pins — pin instructions and files into every prompt.",
             "  /pin                 Open the interactive pinboard",
-            "  /pin add <text>      Pin an editable instruction",
-            "  /pin add @<path>     Pin a live file (reread every prompt)",
+            "  /pin <instruction>   Pin an editable instruction",
+            "  /pin @<path>         Pin a file (reread every prompt)",
+            "  /pin add <value>     Pin text that begins with a command word",
             "  /pin list            List pins with their numbers",
             "  /pin edit [n]        Edit a pin in place",
-            "  /pin remove [n]      Delete a pin",
-            "  /pin clear           Delete all pins",
+            "  /pin remove [n]      Remove a pin",
+            "  /pin clear           Remove all pins",
         ].join("\n"),
         { level: "info" },
     );
@@ -1364,14 +1436,14 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (the session limit defaults to 128 KB; larger files are visibly truncated, and the user can raise an individual pin to the configured ceiling from /pin). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. The path may not exist yet: a missing file is pinned optimistically, shown as \"(not found)\", and injects nothing until it exists. If you need to create the file, create it in a separate earlier step and let that tool call finish before calling pin_file; do not batch creation and pinning. A relative path is resolved against the session's files folder; pass an absolute path for a file anywhere else (e.g. a file in the user's repo).",
+            "Pin a file so its current contents are re-read from disk and re-injected into every subsequent prompt until the user unpins it (the session limit defaults to 128 KB; larger files are visibly truncated, and the user can raise an individual pin to the configured ceiling from /pin). This persistently grows the context window and token use every turn, so avoid large files. Pin ONLY when the user explicitly asks to pin or keep a file in context; NEVER pin proactively or as a side effect of creating, showing, or editing a file. To show or open a file once, use the normal view/read tools — not a pin. A plain relative path uses an existing file in the session's files folder or CLI working directory; if neither exists, it becomes an optimistic session-file pin. Prefix a relative path with ./ to explicitly use the working directory, including for a missing file. If both locations match, the user chooses. Absolute paths are used as-is. If you need to create a session file, create it in a separate earlier step and let that tool call finish before calling pin_file; do not batch creation and pinning.",
         parameters: {
             type: "object",
             properties: {
                 path: {
                     type: "string",
                     description:
-                        "Path to the file to pin. A missing path is accepted optimistically and begins injecting once the file exists; create it in a separate earlier step rather than batching creation with this call. Relative paths resolve against the session's files folder — pass just the file name (e.g. `notes.txt`, not `files/notes.txt`); use an absolute path for files outside it. One optional leading @ is treated as pin syntax; use @@name to pin a filename that actually begins with @.",
+                        "Path to the file to pin. A plain relative path selects an existing session or working-directory file; if neither exists, it becomes an optimistic session-file pin. Use ./path to explicitly select the working directory, or an absolute path to select an exact file. Create a missing session file in a separate earlier step rather than batching creation with this call. One optional leading @ is treated as pin syntax; use @@name to pin a filename that actually begins with @.",
                 },
             },
         },
@@ -1410,7 +1482,7 @@ const tools = [
                 sizeNote = ` (${formatBytes(result.fileInfo.size)}, re-read into context every prompt until unpinned)`;
             }
             const gate = await confirmModelAction(
-                `Allow Copilot to pin this file${sizeNote}?\n${target}`,
+                `Pin this file for the rest of the session${sizeNote}?\n${target}`,
                 `Refused: pinning a file needs confirmation, which isn't available here. The user can pin it explicitly with /pin add ${fmtPath(`@${displayTarget}`)}`,
             );
             if (!gate.ok) {
@@ -1420,7 +1492,7 @@ const tools = [
             if (result.missing && status.added) {
                 // Pinned optimistically: tell the model the file isn't there yet so it
                 // creates it (in a separate step) rather than assuming the pin failed.
-                return `${status.message} The file doesn't exist yet, so it shows as "(not found)" and nothing is injected until it exists — create it in a separate step if you haven't already.`;
+                return `${status.message} The file was not found, so nothing is injected until it exists. Create it in a separate step if needed.`;
             }
             return pinResultMessage(invocation.sessionId, result, status);
         },
@@ -1452,7 +1524,7 @@ const tools = [
             // every subsequent turn. Require explicit user consent, and refuse when
             // no confirmation UI is available. Direct `/pin` invocation is unaffected.
             const gate = await confirmModelAction(
-                `Allow Copilot to pin this instruction into every subsequent prompt this session?\n${shortText(text)}`,
+                `Pin this instruction for the rest of the session?\n${shortText(text)}`,
                 `Refused: pinning an instruction needs confirmation, which isn't available here. The user can pin it explicitly with /pin add ${shortText(text)}`,
             );
             if (!gate.ok) {
@@ -1467,12 +1539,12 @@ const tools = [
         skipPermission: true,
         defer: "never",
         description:
-            "List the pins currently active in this Copilot session (prompt pins and live file pins), each with its number and enabled/disabled state. Enabled pins show a short preview (prompts in double quotes, files as @path) and, for file pins, their approximate size; a running total shows how much is added to every prompt. Disabled pins are shown WITHOUT their content (they are intentionally silenced). Call this before removing a specific pin so you can reference its number, or when diagnosing unexpected behavior to check whether a pinned instruction or file is interfering.",
+            "List the pins currently active in this Copilot session (instructions and files), each with its number and enabled/disabled state. Enabled pins show a short preview (instructions in double quotes, files as @path) and, for file pins, their approximate size; a running total shows how much is added to every prompt. Disabled pins are shown WITHOUT their content (they are intentionally silenced). Call this before removing a specific pin so you can reference its number, or when diagnosing unexpected behavior to check whether a pinned instruction or file is interfering.",
         parameters: { type: "object", properties: {} },
         handler: async (_args, invocation) => {
             const store = await loadStore(invocation.sessionId);
             if (store.pins.length === 0) {
-                return "No pins are set for this session.";
+                return "No pins yet.";
             }
             const summary = await summarizePins(store, invocation.sessionId);
             const lines = [];
@@ -1490,7 +1562,7 @@ const tools = [
                 lines.push(`${head} ${pinDescriptor(pin, invocation.sessionId)}${suffix}`);
             }
             let footer =
-                `\n${pinTotalSummary(summary.totalBytes, summary.unreadable, summary.truncated)}` +
+                `\n${pinTotalSummary(summary)}` +
                 ` (~${approxTokens(summary.totalBytes)} tokens).`;
             if (summary.totalBytes > SOFT_PIN_BUDGET_BYTES) {
                 footer += ` That's a lot of context — consider unpinning or disabling large pins.`;
@@ -1521,7 +1593,7 @@ const tools = [
         handler: async (args, invocation) => {
             const store = await loadStore(invocation.sessionId);
             if (store.pins.length === 0) {
-                return "No pins to remove.";
+                return "No pins yet.";
             }
 
             let index = -1;
@@ -1562,7 +1634,7 @@ const tools = [
             // try to silently delete a user's pinned guardrail. Require explicit
             // confirmation, and refuse when no UI is available.
             const gate = await confirmModelAction(
-                `Allow Copilot to unpin pin ${index + 1} (${victimLabel})?`,
+                `Remove pin ${index + 1}: ${victimLabel}?`,
                 `Refused: removing a pin needs confirmation, which isn't available here. The user can remove it with /pin remove.`,
             );
             if (!gate.ok) {
@@ -1577,9 +1649,9 @@ const tools = [
             // Don't echo a disabled pin's content back to the model — disabled pins
             // are content-redacted elsewhere (pin_list), so report by number only.
             if (!isEnabled(removed)) {
-                return `Unpinned pin ${index + 1} (disabled).`;
+                return `Removed pin ${index + 1} (disabled).`;
             }
-            return `Unpinned pin ${index + 1}: ${victimLabel}.`;
+            return `Removed pin ${index + 1}: ${victimLabel}.`;
         },
     },
     {
@@ -1594,12 +1666,12 @@ const tools = [
             const pinIds = store.pins.map((pin) => pin.id);
             const count = pinIds.length;
             if (count === 0) {
-                return "No pins to clear.";
+                return "No pins yet.";
             }
             // Consent gate: model-initiated wipe of every pin — a prompt-injection
             // could use it to erase all of the user's pinned guardrails at once.
             const gate = await confirmModelAction(
-                `Allow Copilot to clear all ${count} pin${count === 1 ? "" : "s"}?`,
+                `Clear all ${count} pin${count === 1 ? "" : "s"}?`,
                 `Refused: clearing all pins needs confirmation, which isn't available here. The user can clear them with /pin clear.`,
             );
             if (!gate.ok) {
@@ -1648,9 +1720,7 @@ try {
         const active = summary.items.filter((item) => item.enabled);
         const disabled = startupStore.pins.length - active.length;
         await session.log(
-            `session-pins: ${active.length} pin${active.length === 1 ? "" : "s"} active` +
-                (disabled ? ` (${disabled} disabled)` : "") +
-                `, ${pinTotalSummary(summary.totalBytes, summary.unreadable, summary.truncated)} — use /pin to view or manage.`,
+            `Session pins: ${pinTotalSummary(summary, active.length, disabled)}. Use /pin to view or manage.`,
             { level: "info" },
         );
     }

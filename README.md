@@ -1,6 +1,6 @@
 # Session Pins
 
-**Pin instructions and live files so they're injected into every prompt of your Copilot CLI session.**
+**Pin instructions and files so they're injected into every prompt of your Copilot CLI session.**
 
 Copilot has no memory within a session beyond the rolling context. Session Pins lets you
 *stick* the things that must stay salient — a rule, a decision, or a file — so they ride along
@@ -62,16 +62,17 @@ The simplest way — talk to Copilot and it uses the pin tools for you:
 For direct, interactive control there's a single `/pin` command:
 
 ```text
-/pin                  Open the pinboard (browse / add / edit / enable-disable / delete)
-/pin add <text>       Pin an instruction
-/pin add @<path>      Pin a live file  (type @ to open the file picker)
+/pin                  Open the pinboard (browse / add / edit / enable-disable / remove)
+/pin <instruction>    Pin an instruction
+/pin @<path>          Pin a file  (type @ to open the file picker)
+/pin add <value>      Pin text that begins with a command word
 /pin list             List pins
 /pin edit [n]         Edit a pin in place
 /pin remove [n]       Remove a pin
 /pin clear            Remove all
 ```
 
-In the pinboard, prompt pins show in `"quotes"` and file pins are marked with `@`, so text-vs-file is obvious. Each pin also shows its state using the native convention — `✓` active, `•` disabled. Selecting a pin lets you **open** it in an editor (file pins only), edit it in place, **enable/disable** it (a quick way to silence a pin without deleting it), adjust a truncated file's limit, or delete it; `Esc` exits.
+In the pinboard, instructions show in `"quotes"` and files are marked with `@`, so text-vs-file is obvious. Each pin also shows its state using the native convention — `✓` active, `•` disabled. Selecting a pin lets you **open** it in an editor (file pins only), edit it in place, **enable/disable** it (a quick way to silence a pin without removing it), adjust a truncated file's limit, or remove it; `Esc` exits.
 
 ### Enabling and disabling pins
 
@@ -84,19 +85,19 @@ When you ask in plain language, Copilot manages pins through a small set of tool
 | Tool | What it does | Confirmation |
 |------|--------------|--------------|
 | `pin_prompt` | Pin an instruction | Asks before pinning |
-| `pin_file` | Pin a file — relative paths resolve against the session files folder; a not-yet-created file is pinned optimistically and shown `(not found)` until it exists (so a *create-then-pin* request never races) | Asks before pinning |
+| `pin_file` | Pin a file — relative paths resolve by existence against session files and the working directory; a not-yet-created plain path becomes an optimistic session pin | Asks before pinning |
 | `pin_list` | List current pins with their numbers, state, and per-pin/total context cost | None (read-only) |
 | `pin_remove` | Remove one pin by number or text/path match | Asks before removing |
 | `pin_clear` | Remove all pins | Asks before clearing |
 
-Every pin-changing tool is **model-initiated**, so each one asks you to confirm first (see *Safety* below). Only your own `/pin` commands bypass this model-consent gate — though the interactive pinboard still shows an ordinary confirmation for destructive actions like delete and clear. When Copilot needs to *create* a file and pin it, it writes the file into the session files folder in one step, then pins it in a later step.
+Every pin-changing tool is **model-initiated**, so each one asks you to confirm first (see *Safety* below). Only your own `/pin` commands bypass this model-consent gate — though the interactive pinboard still shows an ordinary confirmation for destructive actions like remove and clear. When Copilot needs to *create* a file and pin it, it writes the file into the session files folder in one step, then pins it in a later step.
 
 ### A worked example
 
 > **You:** *"Create a `decisions.md` capturing that we use JWT auth and Postgres, then pin it."*
 >
 > 1. Copilot calls its file-create tool → writes `decisions.md` into the session files folder.
-> 2. Copilot calls `pin_file` with `decisions.md` → you get a prompt: *"Allow Copilot to pin this file (…) ?"* → you approve.
+> 2. Copilot calls `pin_file` with `decisions.md` → you get a prompt: *"Pin this file for the rest of the session (…) ?"* → you approve.
 > 3. Result: `decisions.md` is now pin **1**. Its contents are injected into every subsequent prompt, and stay current as the file is edited.
 >
 > **You:** *"What's pinned?"* → Copilot calls `pin_list`:
@@ -112,11 +113,12 @@ Every pin-changing tool is **model-initiated**, so each one asks you to confirm 
 Session Pins is designed to never break your prompt, even on bad input:
 
 - **A pinned file that doesn't exist yet** — pinning still succeeds (so a *create-then-pin* request never races) and **nothing is injected** for it; the pin is marked `(not found)` in the pinboard and `/pin list`. Once the file exists, its contents appear on the next prompt automatically.
+- **Relative file paths** — a plain `@path` pins the matching file from the session's `files` folder or the CLI working directory. If it exists only in the working directory (as with native `@` autocomplete), that file is pinned and its absolute path is shown. If it exists nowhere, it remains an optimistic session-file pin. `@./path` and `@.\path` explicitly mean the working directory, even for a not-yet-existing file. If both locations contain the same relative path, Session Pins asks which one to use rather than guessing.
 - **A file that exists but can't be read** (e.g. a directory, or a permissions error) — again **nothing is injected**; the pin is marked `(read error)` in the pinboard and `/pin list`. An unreadable pin never injects an error string or the OS error message into the prompt — the model only ever sees pin content that was actually read. The pinboard/list summary also counts how many enabled pins can't be read, so silently-dropped context is visible at a glance.
-- **A file larger than the session limit** — the default is 128 KB. Only the configured number of bytes is injected, followed by a `…[truncated: file exceeds <limit> bytes]` marker, and the `<live_file_pin>` wrapper is tagged `truncated="true"`. The pinboard and `/pin list` also flag it — e.g. `(~200 KB, truncated to 128 KB)` — so clipping is never silent. Select the pin and choose **Raise file limit to `<configured ceiling>`** for a bounded per-file exception; the same menu can restore the session default. Pin large files sparingly: the injected bytes are added to **every** prompt.
+- **A file larger than the session limit** — the default is 128 KB. Only the configured number of bytes is injected, followed by a `…[truncated: file exceeds <limit> bytes]` marker, and the `<live_file_pin>` wrapper is tagged `truncated="true"`. The pinboard and `/pin list` also flag it — e.g. `(~200 KB, truncated to 128 KB)` — so clipping is never silent. Select the pin and choose **Inject up to `<configured ceiling>`** for a bounded per-file exception; the same menu can switch back to the normal session limit. Pin large files sparingly: the injected bytes are added to **every** prompt.
 - **Changing file limits** — edit `settings.maxFileBytes` (normal limit, default 131072) and `settings.maxFileCeilingBytes` (per-pin override target, default 1048576) in the session's `pins.json`. Both values are bytes and must be positive integers no greater than 16777216 (16 MB); the ceiling must be at least the normal limit. Invalid values fall back safely with a warning. Per-file overrides are stored as `maxFileBytes` on that file pin and never exceed the configured ceiling; an invalid override is ignored without dropping the pin.
 - **A corrupt or partially-invalid `pins.json`** — malformed entries are dropped on load (with a logged warning) and the valid pins still load; the prompt hook never throws.
-- **A relative path containing `..`** — rejected. Relative pins are rooted at the session files folder; to pin a file outside the session, pass an absolute path.
+- **A relative path containing `..`** — rejected because its intended base is ambiguous. Pass the exact absolute path instead.
 - **Experimental mode not enabled** — the extension doesn't load at all, so the `/pin` command and pin tools simply won't be present. Launch with `copilot --experimental` (see *Install*).
 
 ## Safety
